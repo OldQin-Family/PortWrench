@@ -1,0 +1,76 @@
+# PortWrench 端口扳手
+
+> Windows 本机的端口管家：让人和 AI 都能一句话看清哪个端口被谁占、能不能关，并在动手前确认「它还是不是原来那个」。只绑 127.0.0.1、不联网、零第三方依赖。版本 1.4.1。
+
+> **版本口径**：当前版本 1.4.1，[FINGERPRINTS.md](FINGERPRINTS.md) 抬头即 1.4.1，与代码 `SERVER_VERSION = "PortConsole/1.4.1"` 一致。
+
+> 本文件是给 AI 读者的**事实与边界说明**，不是操作手册、不是功能广告。它是**索引与边界，不是真源**——功能与安全行为以 [README.md](README.md) 为准，操作口径以 [SKILL.md](SKILL.md) 为准，实际行为以 [port_console.py](port_console.py) 真码为准。
+
+## 先读这几份
+
+- [SKILL.md](SKILL.md)：遇到端口问题时的最短正确路径、五条铁律、CLI/HTTP 用法、返回码速查、排坑与自验（中英对照）。**先读它。**
+- [README.md](README.md) §6「AI 接入」：地址发现、L0 只读查询、关闭固定口径、调用方标签、端口对照表读表约定。完整工程与安全说明也在这份。
+- [site.json](site.json)：机器可读清单——文件表、10 条路由（4 组）、鉴权矩阵、八条保护线、三关验证闸门。
+- [使用说明.md](使用说明.md)：给人的完整操作手册（CLI 与 HTTP 两种用法）。
+- [README.en.md](README.en.md)：英文门面。
+
+## 先记住三句话（它和其他端口工具不一样的地方）
+
+1. **它是本机的**：只绑 `127.0.0.1`、不联网（唯一网络活动是回环）、零第三方依赖（Python 3.10+ 标准库）、Windows only。管不了别的机器。
+2. **先查后杀是铁律**：不许跳过查询直接猜端口/PID；AI 不需要理解 PID，也不需要扒 `netstat`；用 [portctl.py](portctl.py) 做发现与查询。
+3. **它最可贵的品质是「敢拒绝」**：受保护就拒、读不到就拒（fail closed）、`remaining` 非空就不算关干净。普通工具问「能不能杀」，它问「**我怎么确定它还是原来那个**」。
+
+## 四条拒绝语义（别的工具没有，机器必须懂）
+
+| 返回 | 含义 | 该干嘛 |
+|---|---|---|
+| `403 kill_not_allowed` | 命中保护线——受保护目标、Session 0、System32 宿主、信息读不到（fail closed）、用户手动保护 | **不要再试**，说明这是保护线，不是故障 |
+| `409 target_changed` | 端口易主 / PID 复用（扫描到动手之间那几百毫秒） | **重新确认**，别拿旧快照追杀新进程 |
+| `409 multiple_owners` | 多个占用者 | 退回 GET 看清单，**不自动选**；要点名用严格模式 |
+| `400 target_identity_required` | 指纹缺失/过期（`snapshot_id` 60 秒有效） | 重新 GET 取指纹 |
+| `429 rate_limited` | 真实强杀频率闸（每通道每分钟 6 次；`already_free` 不计入） | 等一分钟，检查是不是调用循环 |
+
+**验收语言（唯一判据）**：只有 `ok:true 且 remaining=[]` 才算「关干净」。`already_free=true` 是幂等（本来就没占）。`remaining` 非空＝父退出子残留或端口易主，按当前占用者重新确认。
+
+## 保护线与验证闸门（判定逻辑；机器可读版见 [site.json](site.json)）
+
+**动手前两道闸，任意一道不放行就停：**
+
+1. **保护线八条**（命中即拒，不看别的）：[protection.json](protection.json) 列的端口（135/139/445/3389/5985/5986）与进程（System/Registry/smss/csrss/wininit/winlogon/services/lsass/MsMpEng）；控制台自身；`pid ≤ 4`；Session 0；System32 关键宿主；会话信息取不到（fail closed）；[rules.json](rules.json) 判 `system` 级；子树（`/T`）含以上任一项→整次拒绝。
+2. **三关指纹**：① 句柄还在吗 ② 能打开吗 ③ 创建时间还是那个吗（`started`）。第三关是最后一道——没有时间指纹，「杀的就是它」这句承诺兑现不了。
+
+**同一个软件，用户态可关、服务态受保护**——判定依据是会话和路径，不是软件名。这不是矛盾，是保护线在正确工作。
+
+## 数字（全部从实物复核，2026-11-17）
+
+| 项 | 值 | 出处 |
+|---|---|---|
+| 单元测试 | **159 个** | [tests](tests)（[test_port_console.py](tests/test_port_console.py)，`unittest discover`） |
+| 端到端验收 | **21 步** | [acceptance_api.py](tests/acceptance_api.py) |
+| 自动识别规则 | **21 条**（通用示例，不含本机定制） | [rules.json](rules.json) |
+| 端口知识库 | **108 条** | [ports.json](ports.json) / [ports.md](ports.md) |
+| 识别率 | 1.0.1 时 21 条规则下实测约 **54%**，**未宣称达标**（达标线 70%） | [README.md](README.md) §6.5 |
+| 展示缓存 | **5 秒**（`GET /api/v1/ports`；只用于展示，关闭链路零交集） | README / SKILL |
+| 快照指纹有效期 | **60 秒**（`snapshot_id`） | README §6.3 |
+| 真实强杀频率闸 | **每通道 6 次/分钟**（`already_free` 不计入） | SKILL 返回码表 |
+| 端口区间 | **3999–4098**（被占自动顺延） | README §6.1 |
+| 审计日志 | `kill_audit.jsonl`，超 1 MiB 轮转，最多 3 个备份 | README §7 |
+| 运行依赖 | **零第三方包**，Python 3.10+ 标准库 | README 头部 |
+
+> ⚠️ **识别率不宣称达标**：54% 是实测值，达标线 70%。AI 对外描述时必须照实说「约 54%、未达标」，不许说「能认全」。
+
+## 边界（它不做什么）
+
+- **不加速关闭**：关一次仍几秒。快的是「看」（1.4s→19ms），不是「杀」。
+- **不跨平台、不跨机器**：只 Windows、只 `127.0.0.1`。
+- **不保证认全**：常见软件能认，其余标「未知」——不瞎猜。`generic:true` 的对照表条目不得当本机进程身份。
+- **不是多用户工具**：按单用户本机设计；多个 Windows 账户需改「UI 通道强制 Origin」才可部署。
+- **四次拒绝**：不做一键全杀（Kill All 是蓝屏常见起点）、不做按名称批量清理、不碰无端口的进程、不因「看起来像」就动手。
+
+## 口径真源与注意
+
+- 身份判定只认 [rules.json](rules.json) / `port_map.json`（运行时生成）；端口对照表（[ports.json](ports.json) / [ports.md](ports.md)）是知识层，**不参与任何关闭判定**——删掉它 `kill_allowed` 逐字节不变（有单测把守）。
+- token（`api_token.txt`）等同本机授权：不打印、不落聊天窗、不外传。
+- **版本真源**：以 `SERVER_VERSION = PortConsole/1.4.1`（`port_console.py:53`）为准；[SKILL.md](SKILL.md) frontmatter 本版同步为 1.4.1。
+- **运行时自建件**（不在本发布包内，AI 别当发布文件去找）：`runtime.json`、`port_map.json`、`unknown.json`、`dynamic_protection.json`、`kill_audit.jsonl`、`api_token.txt`——由程序在本机运行时生成，不随包分发、不入指纹账。
+- 许可与署名见 [LICENSE](LICENSE) / [NOTICE.md](NOTICE.md) / [CHANGELOG.md](CHANGELOG.md)。

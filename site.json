@@ -1,0 +1,135 @@
+{
+  "site": "PortWrench · 端口扳手",
+  "owner": "OldQin Family（老秦 Family）",
+  "type": "windows-local-port-manager",
+  "language": "zh-CN",
+  "version": "1.4.1",
+  "version_note": "1.4.1 为纯补丁（测试告警与文档更正），产品运行逻辑相对 1.4.0 零改动。port_console.py 的 SERVER_VERSION 是 PortConsole/1.4.1；SKILL.md frontmatter 与 FINGERPRINTS.md 抬头均为 1.4.1，全链一致。",
+  "license": "MIT",
+  "api": "/api/v1（挂在 127.0.0.1:3999，被占顺延 3999–4098；用 portctl.py health 或有界发现取真实 base_url）",
+  "api_note": "插件接口不是独立服务，是本机 port_console.py 起的 HTTP 服务。只绑 127.0.0.1、不联网、零第三方依赖。默认 L0（发现/只读查询）无 token，L2（真实强杀）需 token。",
+  "shape": "Windows 本机端口管家：人和 AI 都能一句话看清哪个端口被谁占、能不能关；动手前验明正身（保护线八条 + 三关指纹 + fail closed），只认 remaining=[] 为关干净。不含语音、不生成图片、不管别的机器。",
+  "ai_entrypoints": [
+    { "path": "SKILL.md", "role": "最短正确路径：五条铁律、CLI/HTTP 用法、返回码速查、排坑与自验（中英对照）" },
+    { "path": "llms.txt", "role": "给 AI 的事实与边界：四条拒绝语义、保护线与验证闸门、数字、不做什么" },
+    { "path": "README.md", "role": "完整工程与安全说明，§6 为 AI 接入全文" },
+    { "path": "site.json", "role": "机器可读清单（本文件）" }
+  ],
+  "pages": [
+    { "path": "README.md", "role": "主门面：界面、设计初衷、它不是什么、安装、隐私、安全九节、AI 接入、目录结构" },
+    { "path": "README.en.md", "role": "英文门面" },
+    { "path": "SKILL.md", "role": "AI 最短路径与铁律（中英对照）" },
+    { "path": "llms.txt", "role": "AI 事实与边界（本轮新增）" },
+    { "path": "site.json", "role": "机器可读清单（本文件，本轮新增）" },
+    { "path": "使用说明.md", "role": "给人的完整操作手册（CLI 与 HTTP）" },
+    { "path": "DEVELOPMENT.md", "role": "开发说明：这个工具怎么来的" },
+    { "path": "CHANGELOG.md", "role": "版本链与已知问题" },
+    { "path": "NOTICE.md", "role": "第三方来源与许可（中文）" },
+    { "path": "NOTICE.en.md", "role": "第三方来源与许可（英文）" },
+    { "path": "LICENSE", "role": "MIT（含上游版权声明）" },
+    { "path": "icon.png", "role": "项目图标（家族铃铛扳手）" },
+    { "path": "index.html", "role": "前端单页（无外部资源，浏览器界面）" },
+    { "path": "assets/brand/", "role": "家标准铃铛 icon 全套（三色×三规格 + svg）" },
+    { "path": "assets/team/", "role": "家人墙头像 15 张（本轮由 12 补到 15，与家标准素材库逐字节一致）" },
+    { "path": "assets/截图/", "role": "真机界面截图 2 张（已脱敏）" },
+    { "path": "port_console.py", "role": "主程序单文件：扫描、判定、关闭、HTTP API" },
+    { "path": "portctl.py", "role": "命令行客户端（给 AI 与终端用）" },
+    { "path": "rules.json", "role": "自动识别规则（21 条通用示例，不含本机定制）" },
+    { "path": "protection.json", "role": "保护表：端口 [135,139,445,3389,5985,5986] + 进程名单" },
+    { "path": "ports.json", "role": "端口知识库（108 条）" },
+    { "path": "ports.md", "role": "端口对照表（人读版）" },
+    { "path": "tests/", "role": "159 单测 + 21 步端到端验收" },
+    { "path": "packages/dsh-portwrench/", "role": "DSH 薄壳：package.json + cordis.patch.yml + lib/" },
+    { "path": "启动端口控制台.bat", "role": "双击启动" },
+    { "path": "FINGERPRINTS.md", "role": "发布件逐件校验清单（SHA 前 16，分组），收口时随新包重算" }
+  ],
+  "pages_note": "pages 为导航与主要文件，非全清单；逐件哈希见 FINGERPRINTS.md。本项目没有 HARDWARE.md（零第三方依赖、无硬件门槛章节），因此不列此条。",
+  "routes": {
+    "prefix": "/api/v1",
+    "groups": {
+      "发现与自检": ["/health", "/protection"],
+      "只读查询": ["/ports", "/agent/ports"],
+      "AI 主路径": ["/agent/kill", "/agent/kill-by-port"],
+      "UI 通道": ["/ui/kill", "/ui/protect", "/ui/rename", "/ui/unprotect"]
+    },
+    "note": "路由取自 port_console.py 真码（共 10 条）。AI 主路径＝health→agent/ports→agent/kill-by-port；UI 四条是浏览器界面用，非 AI 主路径，列此仅为完整索引。真源是 port_console.py。",
+    "token_required": {
+      "L0_no_token": ["/health", "/protection", "/ports", "/agent/ports"],
+      "L2_requires_token": ["/agent/kill", "/agent/kill-by-port"],
+      "ui_session": ["/ui/kill", "/ui/protect", "/ui/rename", "/ui/unprotect"]
+    }
+  },
+  "auth_matrix": {
+    "default": "L0（health/ports/agent-ports）无 token；L2（真实强杀）需 X-Port-Console-Token（本包 api_token.txt）",
+    "token_file": "api_token.txt",
+    "token_rule": "token 等同本机授权：不打印、不落聊天窗、不外传；建议带 X-Port-Console-Client 短标识供审计留名",
+    "fail_closed": "exe/会话/启动时间读不到的目标一律拒杀（宁可拒杀不赌）"
+  },
+  "protection_lines": {
+    "note": "八条保护线，命中即拒、不看别的。数据源 protection.json + rules.json + 真码判定。AI 被 403 时不要重试——这不是故障。",
+    "lines": [
+      "protection.json 里的端口与进程（端口 135/139/445/3389/5985/5986；进程 System/Registry/smss/csrss/wininit/winlogon/services/lsass/MsMpEng）",
+      "控制台自身进程与自身端口",
+      "pid ≤ 4",
+      "Session 0（会话 0）的一切进程",
+      "可执行文件在 C:\\Windows\\System32 的关键宿主",
+      "会话信息取不到（fail closed）",
+      "rules.json 判定为 system 级",
+      "子树（/T）含以上任一项 → 整次拒绝"
+    ],
+    "source_files": ["protection.json", "rules.json", "port_console.py"],
+    "on_hit": "HTTP 403 kill_not_allowed —— 停止，向用户说明是保护线"
+  },
+  "verification_gates": {
+    "note": "动手前验明正身：保护线八条全过后，再过三关指纹；执行后只认 remaining=[]。这是本工具信任的来源，也是机器该能读的核心字段。",
+    "before_kill": [
+      { "gate": 1, "name": "句柄还在吗", "on_fail": "400/409 重新确认" },
+      { "gate": 2, "name": "能打开吗", "on_fail": "403 拒杀" },
+      { "gate": 3, "name": "创建时间还是那个吗（started）", "on_fail": "409 target_changed 重新确认", "note": "最后一道——没有时间指纹，'杀的就是它'兑现不了" }
+    ],
+    "done_criterion": "ok:true 且 remaining=[]；already_free=true 为幂等；remaining 非空＝残留或易主，按当前占用者重确认",
+    "audit": "kill_audit.jsonl 前后各一行；超 1 MiB 轮转，最多 3 个备份"
+  },
+  "config": {
+    "default_port": 3999,
+    "port_range": "3999–4098（被占自动顺延）",
+    "runtime_file": "runtime.json（写在监听成功之后，含 base_url，不含 token）",
+    "discovery": "portctl.py health 内置有界发现：3999–4098 逐个验 ok:true + api_version:v1 + port + 实例号；多实例且无有效 runtime.json 时拒绝执行（不猜）",
+    "identity_source": "rules.json / port_map.json（source=auto/manual）；ports.json 对照表不参与身份判定"
+  },
+  "version_facts": {
+    "package_version": "1.4.1",
+    "skill_frontmatter": "1.4.1（本版同步）",
+    "server_version": "PortConsole/1.4.1（port_console.py:53，代码本就是 1.4.1）",
+    "fingerprints_header": "1.4.1（与包版本、SERVER_VERSION、SKILL frontmatter 全链一致）",
+    "api_version": "v1",
+    "change_note": "1.4.1 纯补丁：测试告警与文档更正；产品运行逻辑零改动"
+  },
+  "constraints": {
+    "platform": "Windows only",
+    "network": "只绑 127.0.0.1，不联网；唯一网络活动是回环",
+    "dependencies": "零第三方包，Python 3.10+ 标准库",
+    "display_cache": "GET /api/v1/ports 有 5 秒展示缓存，只用于展示；身份判定/杀前确认一律用 agent/ports?port=X（永远新鲜）或 ?refresh=1",
+    "snapshot_ttl_seconds": 60,
+    "rate_gate": "每通道每分钟 6 次真实强杀（already_free 不计入）",
+    "multi_user": "按单用户本机设计；多个 Windows 账户需改 UI 通道强制 Origin 才可部署"
+  },
+  "redlines": [
+    "不做一键全杀（Kill All 是蓝屏常见起点）",
+    "不做按名称批量清理",
+    "不碰无端口的进程",
+    "不因为'看起来像'就动手",
+    "token 不打印、不外传",
+    "403 不要再试（保护线是设计，不是故障）"
+  ],
+  "numbers": {
+    "unit_tests": 159,
+    "e2e_steps": 21,
+    "identification_rules": 21,
+    "ports_kb": 108,
+    "recognition_rate": "约 54%（1.0.1 实测，未宣称达标；达标线 70%）",
+    "audit_rotation": "1 MiB，最多 3 备份"
+  },
+  "credits": "「老秦 Family」（OldQin Family）作品；署名见 README 底部（老秦/小牛总/豆总/阿极/阿枢/小深/爪总/见微/阿衡）",
+  "generated_from": "所有事实取自本包 README.md / README.en.md / SKILL.md / llms.txt / port_console.py 真码 / protection.json / rules.json / tests，2026-11-17 逐项复核；本文件与 llms.txt 是索引与边界，不是真源。"
+}
