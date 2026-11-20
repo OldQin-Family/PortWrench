@@ -1,65 +1,25 @@
-# PortWrench 端口扳手 · 指纹清单（1.4.1 发布版）
+# PortWrench 端口扳手 · 指纹清单（1.4.2 发布版）
 
 > **发布版**：21 条通用示例规则 ＋ 6 个系统保护端口，不含任何本机定制。
 > **认版口径**：SHA256 前 16 位。运行时自建件（`runtime.json` / `port_map.json` /
 > `dynamic_protection.json` / `unknown.json` / `kill_audit.jsonl` / `api_token.txt`）不入表。
-> **本表为 1.4.1 整理版全量现算**：含整机流程图六件、AI 入口两件（llms.txt / site.json）、家人墙头像 15 张（其中老伙计／小枢／爪总按定稿源 512×512 重出）、详情截图命令行整条遮蔽、`启动端口控制台.bat` CRLF。抬头 1.4.1 与 `SERVER_VERSION = "PortConsole/1.4.1"`、SKILL.md frontmatter 一致。
-
-## 本体与 CLI（7 件）
-
-| 文件 | 字节 | SHA256 前 16 |
-|---|---:|---|
-| `index.html` | 30,108 | `339FB01C5615F6B7` |
-| `port_console.py` | 129,873 | `B88863A57FBBAE76` |
-| `portctl.py` | 21,504 | `DE1DF28F904422E6` |
-| `ports.json` | 47,595 | `0DC0F560D532EA31` |
-| `ports.md` | 9,010 | `024B3209DEFF1B49` |
-| `protection.json` | 176 | `088CF0D167A2CE96` |
-| `rules.json` | 2,000 | `D7868BC85C1CFBCF` |
-
-## 文档（15 件）
+> **本表为 1.4.2 GitHub 发布版全量现算**：含整机流程图六件（按 1.4.1 主流程绘制，1.4.2 授权步骤见 README §2/§6）、
+> AI 入口两件（llms.txt / site.json，已同步 1.4.2）、家人墙头像 15 张、详情截图命令行整条遮蔽、
+> `启动端口控制台.bat` CRLF（1.4.2 修复版）。抬头 1.4.2 与 `SERVER_VERSION = "PortConsole/1.4.2"`、SKILL.md frontmatter 一致。
+> 分发 zip `portwrench-1.4.2-github.zip` 不入本表（自指排除）。
 
 | 文件 | 字节 | SHA256 前 16 |
 |---|---:|---|
 | `.gitattributes` | 502 | `CC3B1A191CD01369` |
 | `.gitignore` | 643 | `AEBA1FFD20F524D7` |
-| `CHANGELOG.md` | 30,441 | `8A993B7FECA79AB4` |
-| `DEVELOPMENT.md` | 10,070 | `764D5353CD883F2A` |
+| `CHANGELOG.md` | 33,765 | `E9D7CFB7C20BC79B` |
+| `DEVELOPMENT.md` | 10,164 | `13B70BF43A6CE4CF` |
 | `LICENSE` | 1,070 | `0783452F7ED48AE9` |
 | `NOTICE.en.md` | 8,339 | `EB94935F67C93E0F` |
 | `NOTICE.md` | 7,665 | `80F41D7229D95817` |
-| `README.en.md` | 33,921 | `A602AD8701C7AD39` |
-| `README.md` | 28,783 | `80F22F5C98E15904` |
-| `SKILL.md` | 8,243 | `48FCB00239C3CD25` |
-| `icon.png` | 13,751 | `7AFF6A9D46155FDD` |
-| `llms.txt` | 6,992 | `B6F9EF8E60AA566C` |
-| `site.json` | 9,524 | `66F735697D5D6CB5` |
-| `使用说明.md` | 10,069 | `F8E685039AD38433` |
-| `启动端口控制台.bat` | 643 | `097242DFDD04C1D7` |
-
-## DSH 薄壳（5 件）
-
-| 文件 | 字节 | SHA256 前 16 |
-|---|---:|---|
-| `packages/dsh-portwrench/README.md` | 3,294 | `A88D0503C49CA25D` |
-| `packages/dsh-portwrench/cordis.patch.yml` | 60 | `583BC1E423C8CF36` |
-| `packages/dsh-portwrench/lib/client.js` | 981 | `EA11135286326CA1` |
-| `packages/dsh-portwrench/lib/index.mjs` | 4,984 | `3B38E9EA0E5BE6E0` |
-| `packages/dsh-portwrench/package.json` | 769 | `4E07D1DFB86F9B19` |
-
-## 测试（4 件）
-
-| 文件 | 字节 | SHA256 前 16 |
-|---|---:|---|
-| `tests/acceptance_api.py` | 30,101 | `D213E813C24897AA` |
-| `tests/fixture_process_tree.py` | 2,555 | `0F3DE8E73EAA003A` |
-| `tests/fixture_windowed.ps1` | 1,529 | `95B4CD36235DB02A` |
-| `tests/test_port_console.py` | 167,566 | `1249C2AE00A7833A` |
-
-## assets（33 件）
-
-| 文件 | 字节 | SHA256 前 16 |
-|---|---:|---|
+| `README.en.md` | 35,125 | `5D0926644E5FD125` |
+| `README.md` | 29,924 | `760BF4FACC0F27BD` |
+| `SKILL.md` | 9,654 | `F845D76E35C3EE42` |
 | `assets/brand/bell-black-128.png` | 3,141 | `D3ACB651D3D4CCA9` |
 | `assets/brand/bell-black-48.png` | 1,195 | `AB92EF13AFD3B4D8` |
 | `assets/brand/bell-black-512.png` | 13,751 | `7AFF6A9D46155FDD` |
@@ -93,8 +53,32 @@
 | `assets/流程图/portwrench-flow-en-agent-v1.4.1.png` | 197,690 | `8EC7C7C11A14C45F` |
 | `assets/流程图/portwrench-flow-en-person-v1.4.1.png` | 225,895 | `9E02FD68EA2E5A1B` |
 | `assets/流程图/portwrench-flow-en-refusal-v1.4.1.png` | 229,609 | `2E71BAC644F48701` |
+| `icon.png` | 13,751 | `7AFF6A9D46155FDD` |
+| `index.html` | 30,108 | `339FB01C5615F6B7` |
+| `llms.txt` | 7,512 | `50CF2F9874073E8D` |
+| `local_ops.py` | 16,260 | `7718B6AE67440936` |
+| `packages/dsh-portwrench/README.md` | 3,321 | `67B7385C6929873A` |
+| `packages/dsh-portwrench/cordis.patch.yml` | 60 | `583BC1E423C8CF36` |
+| `packages/dsh-portwrench/lib/client.js` | 981 | `EA11135286326CA1` |
+| `packages/dsh-portwrench/lib/index.mjs` | 4,974 | `DAB673244E1A3BFD` |
+| `packages/dsh-portwrench/package.json` | 755 | `7A6EA543DE3EC364` |
+| `port_console.py` | 149,182 | `8C3B5377DE5FA551` |
+| `portctl.py` | 31,454 | `0C6D6BE41CFE5E94` |
+| `ports.json` | 47,595 | `0DC0F560D532EA31` |
+| `ports.md` | 9,010 | `024B3209DEFF1B49` |
+| `protection.json` | 176 | `088CF0D167A2CE96` |
+| `rules.json` | 2,000 | `D7868BC85C1CFBCF` |
+| `site.json` | 11,437 | `A0441D2943365D2F` |
+| `tests/acceptance_api.py` | 30,474 | `F0C73A0770703EAB` |
+| `tests/fixture_process_tree.py` | 2,555 | `0F3DE8E73EAA003A` |
+| `tests/fixture_windowed.ps1` | 1,504 | `8CDFF3B8C427725B` |
+| `tests/test_port_console.py` | 177,270 | `2F1ADAF819B3EE66` |
+| `tests/test_portctl.py` | 10,570 | `6F76A4A93DA48D35` |
+| `user_consent.py` | 7,607 | `D4ED87BE689A3CC6` |
+| `使用说明.md` | 10,616 | `C9F1EB1E1E8B31CE` |
+| `启动端口控制台.bat` | 666 | `925D6B1B33210044` |
 
-- 清单文件数：64；整树摘要（1.4.1 口径）：`817F800B8DE430BCED9C6C63063CF90B4DE4E513641C994F551A65A257C29762`。
-- **换行口径（1.3 项⑧a）：本清单所有字节数/SHA256 锚定 LF 字节；发布流程禁止 CRLF 检出打 zip，仓库已加 `.gitattributes` 强制 LF。**
-- **整树摘要口径（1.4.1 补，可判）：`sha256( Σ( 相对路径 + "\0" + 字节数 + "\0" + SHA256 + "\n" ) )`；按相对路径字典序排序后拼接；SHA256 取大写十六进制全文；每条（含最后一条）以换行 `\n` 结尾；排除 `__pycache__` 与 `*.pyc`。**
-- **验证归属（1.3 项⑧b）：本包验证以 `tests/` 自跑结果为准，不把作者环境结论当成任何其他机器的背书。**
+- 清单文件数：67；整树摘要（1.4.2 口径）：`C7CAFAE75A3F48646B429BDFDB54FB68EA7975F98E02AF112EECCCA6A607A88E`。
+- **换行口径**：本清单所有字节数/SHA256 锚定 LF 字节；`启动端口控制台.bat` 例外为 CRLF（cmd.exe 兼容），仓库 `.gitattributes` 已声明。
+- **整树摘要口径**：`sha256( Σ( 相对路径 + "\0" + 字节数 + "\0" + SHA256 + "\n" ) )`；按相对路径字典序排序后拼接；SHA256 取大写十六进制全文；每条（含最后一条）以换行 `\n` 结尾；排除 `__pycache__`、`*.pyc`、本表自身与分发 zip。
+- **验证归属**：本包验证以 `tests/` 自跑结果为准（1.4.2 全量 174 单测、21 步验收），不把作者环境结论当成任何其他机器的背书。

@@ -6,7 +6,7 @@
 
 # PortWrench · 端口扳手
 
-> **当前版本：1.4.1**（纯补丁；产品运行逻辑零改动）
+> **当前版本：1.4.2**（离线证据闭环、显式本机授权、绝对路径收口）
 
 > **今天起，只用说一句话，让 AI 帮你操纵端口。**
 >
@@ -38,6 +38,8 @@ C:\> netstat -ano | findstr :3000
 ## 整机流程图
 
 三张图，按你看的角度分开：**人怎么用** / **AI 怎么用** / **它什么时候拒绝**。缩略图点开可看原图；图上文字为说明性表述，**细节以 README 正文为准**。
+
+> 流程图按 1.4.1 主流程绘制；1.4.2 起在线多占用与离线关闭新增「本机授权窗口」一步（见 §2 与 §6），图待下一版重绘。
 
 **① 人怎么用**——双击 → 看表 → 两级确认 → 关干净（它不是一键全杀）：
 
@@ -256,8 +258,9 @@ AI 也可以直接调 HTTP API，见 [§6](#6-ai-接入ai-看这里)。
 ## 2. 关闭能力与两道确认
 
 - UI 通道两阶段：先尝试正常关窗（`WM_CLOSE`）；未完成才允许强杀，强杀需第二次确认。
-- AI 通道单次直达：持管理 token + `confirm:true`，但杀前重扫、身份校验、系统/子树护栏、  
-  杀后验证一个不少——免的是人工审批，不免任何安全校验。
+- 在线单占用：持管理 token、`confirm:true` 和有效 `snapshot_id`/指纹；杀前重扫、身份校验、系统/子树护栏、杀后验证一个不少。
+- 在线多占用：必须先调 `/api/v1/agent/authorize`，由本机授权窗口选择候选并取得一次性 `user_grant_id`，再提交严格关闭；agent 自行填写 `pid/proc/started` 不等于用户授权。
+- 离线场景：`local_ops.py` 的本机快照只标注 `local_clue`，关闭前必须经本机授权窗口；不冒充控制台 API 结论，不把本地快照当作端口空闲证据。
 - **一律不做**：一键全杀、按名称清理、按归属批量关闭、对无端口进程的操作。
 - 关闭动作只对「当前正在监听该端口」的进程树生效；杀必杀树（`taskkill /T /F`）。
 
@@ -278,8 +281,9 @@ AI 也可以直接调 HTTP API，见 [§6](#6-ai-接入ai-看这里)。
 
 ## 4. token 与凭据安全
 
-- `api_token.txt` 是 **L2 程序化关闭**的唯一凭据：首次启动自动生成（`token_urlsafe(32)`）。
-- 它**等同于本机授权**：不进仓库、不截图、不放共享目录、不写进任何会发出去的文件。
+- `api_token.txt` 是 **L2 程序化通道**凭据：首次启动自动生成（`token_urlsafe(32)`）。
+- token 证明调用方获准使用程序化接口，**不等同于用户对具体目标的一次性授权**；多占用仍需 `user_grant_id`。
+- 它不进仓库、不截图、不放共享目录、不写进任何会发出去的文件。
 - 请求只从请求头 `X-Port-Console-Token` 接收；URL 传 token 一律拒绝；比较用常量时间函数。
 - token 不出现在任何 API 响应、`runtime.json`、页面或日志里。
 - 轮换：停控制台 → 删除或替换 `api_token.txt` → 重启 → 同步给获授权 AI。
@@ -366,18 +370,24 @@ GET /api/v1/ports                  # 完整条目（命令行默认脱敏；同�
 ### 6.3 关闭：固定口径「先查后杀」
 
 ```
-GET  /api/v1/agent/ports?port=X     → 看 name/level/kill_allowed，确认这就是要清的目标
+# 单占用：先查后杀
+GET  /api/v1/agent/ports?port=X     → 看 name/level/kill_allowed，取得 snapshot_id
 POST /api/v1/agent/kill-by-port     {"port":X,"snapshot_id":"<上一步取得>","confirm":true}
+
+# 多占用：先本机授权，再严格关闭
+POST /api/v1/agent/authorize        {"port":X}
+     → 本机窗口选择候选，返回 user_grant_id
+POST /api/v1/agent/kill             {"port":X,"pid":...,"proc":...,"started":...,"confirm":true,"user_grant_id":"<上一步取得>"}
 Header: X-Port-Console-Token: <token>   （可选 X-Port-Console-Client: zcode/dsh/...）
 ```
 
 - 端口已空 → `ok=true, already_free=true`（幂等，重试逻辑可以死掉）；
-- 多个占用者 → `409 multiple_owners` + `candidates`：**不做自动选择**，  
-  退回 GET 看清单，需要点名时用严格模式 `POST /api/v1/agent/kill {port,pid,proc,started,confirm:true}`；
+- 多个占用者 → `409 multiple_owners` + `candidates`：**不做自动选择**；必须先调 `/agent/authorize` 由用户本机选择，不能由 agent 从候选中自行点名；
+- 授权窗口取消/超时/无交互 → 不签发 `user_grant_id`，本次不关闭；
+- 授权请求超限 → `429 rate_limited`，不扫描、不弹窗；
 - 指纹缺失/过期 → `400 target_identity_required`（重新 GET 取指纹）；
-- 端口易主 → `409 target_changed`（重新确认，别硬来）；
+- 端口易主、grant 复用或绑定信息变化 → `409 target_changed`/拒绝授权（重新确认，别硬来）；
 - 受保护 → `403 kill_not_allowed`（**不要再试**）；
-- 触发频率闸 → `429 rate_limited`（每通道每分钟 6 次真实强杀上限；`already_free` 不计入）。
 - 只有 `ok=true 且 remaining=[]` 才算「关干净」。
 
 ### 6.4 调用方标签
@@ -445,7 +455,7 @@ Agent 请求建议带 `X-Port-Console-Client`（任意短标识，如 `zcode`、
 - **测试**：`python -m unittest discover -s tests -v` 跑单元测试；  
   服务启动后 `python tests\acceptance_api.py --base-url http://127.0.0.1:3999 --token-file api_token.txt`  
   跑自动验收（只用脚本自建的测试进程，不碰你的真实服务）。
-- 杀毒软件误报说明：`tests\test_port_console.py` 含有用于测试的"伪装系统进程路径"数据（冒充 svchost.exe 落在非系统目录——端口扳手必须识别并拒绝这类伪装，这些数据就是用来验证这一点的），部分杀毒软件可能将其静态识别为木马（历史确认案例：火绒 Trojan/Python.ShellLoader.ad，针对本版之前的测试文件）。这不影响产品任何功能：`tests\` 仅单元测试使用，不参与运行。若你的杀毒软件报警，可将该文件加入信任区或忽略；本版已调整该段测试数据，在 Python 3.12、火绒开启的机器上跑通 159 项测试、文件零损失；其余杀软未逐一验证。不运行单元测试则完全无感。
+- 杀毒软件误报说明：`tests\test_port_console.py` 含有用于测试的"伪装系统进程路径"数据（冒充 svchost.exe 落在非系统目录——端口扳手必须识别并拒绝这类伪装，这些数据就是用来验证这一点的），部分杀毒软件可能将其静态识别为木马（历史确认案例：火绒 Trojan/Python.ShellLoader.ad，针对本版之前的测试文件）。这不影响产品任何功能：`tests\` 仅单元测试使用，不参与运行。若你的杀毒软件报警，可将该文件加入信任区或忽略；本版已调整该段测试数据，在 Python 3.12、火绒开启的机器上跑通 174 项测试、文件零损失（1.4.1 基线时 `tests\test_port_console.py` 内为 159 个测试函数；1.4.2 `discover` 全量 174 项）；其余杀软未逐一验证。不运行单元测试则完全无感。
 
 ## 目录结构（发布版）
 

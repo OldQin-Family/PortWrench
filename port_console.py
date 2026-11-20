@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import copy
 import errno
+import hashlib
 import hmac
 import json
 import msvcrt
@@ -50,7 +51,7 @@ from ctypes import wintypes
 BASE_DIR = Path(__file__).resolve().parent
 
 API_VERSION = "v1"
-SERVER_VERSION = "PortConsole/1.4.1"  # 1.4 H-01：Server 响应头随发布版本
+SERVER_VERSION = "PortConsole/1.4.2"  # 1.4 H-01：Server 响应头随发布版本
 DEFAULT_PORT = 3999
 PORT_SCAN_RANGE = 100          # 3999 起顺延尝试数
 PS_TIMEOUT = 8.0               # §5.1 扫描超时
@@ -60,6 +61,10 @@ SNAPSHOT_TTL = 60.0            # §4.9 指纹 60 秒有效
 TICKET_TTL = 60.0              # §6.3 ticket 60 秒有效期
 KILL_RATE_LIMIT = 6            # §6.3 每分钟真实强杀上限
 KILL_RATE_WINDOW = 60.0
+AUTHORIZE_RATE_LIMIT = 6       # R1 §5.3：authorize 弹窗前每 (token HMAC, port) 6 次/分钟
+AUTHORIZE_RATE_WINDOW = 60.0
+AUTHORIZE_GRANT_TTL = 60.0     # R1 §5.2：授权 60 秒、单次、内存、通道绑定
+AUTHORIZE_GRANT_MAX = 500      # 内存上限，超出先清过期/已用
 WM_CLOSE_WAIT = 2.0            # §6.4 最多等 2 秒
 WM_CLOSE_POLL = 0.2            # §6.4 每 200ms 复核
 KILL_VERIFY_WINDOW = 3.0       # §6.3 强杀后验证窗口
@@ -100,6 +105,26 @@ ERROR_ACCESS_DENIED = 5
 
 SYSTEM32_PREFIX = os.path.abspath(
     os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")) + os.sep
+
+
+def _resolve_system32_tool(relative_path: str) -> str:
+    """Resolve a tool under %SystemRoot%\\System32 without consulting PATH.
+
+    Standard 64-bit view first. A 32-bit process additionally gets the
+    Sysnative view, which is the only way a 32-bit process can reach the
+    64-bit System32 directory. Never fall back to a bare name or PATH.
+    """
+    system_root = os.path.abspath(os.environ.get("SystemRoot", r"C:\Windows"))
+    candidates = [os.path.join(system_root, "System32", relative_path)]
+    if ctypes.sizeof(ctypes.c_void_p) == 4:
+        candidates.append(os.path.join(system_root, "Sysnative", relative_path))
+    for candidate in candidates:
+        path = os.path.abspath(candidate)
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "standard system tool not found: " + " | ".join(os.path.abspath(c)
+                                                          for c in candidates))
 
 # System32「关键宿主」名单（方案 §4.2 原文限定"关键宿主"而非一切 System32 可执行文件）：
 # 控制台程序的 conhost.exe、cmd.exe 等用户态伴生**不在名单**——它们正是"黑框"本体，
@@ -196,6 +221,10 @@ class ScanError(Exception):
 
 class ConfigError(Exception):
     """配置损坏（§4：拒绝启动）。"""
+
+
+class TaskkillLaunchError(Exception):
+    """taskkill 标准路径解析或进程启动失败；关闭请求必须 fail closed。"""
 
 
 def now_iso() -> str:
@@ -519,16 +548,31 @@ def _extract_ps_stderr(data: bytes, limit: int = 300) -> str:
     return _squash_err_text(text, limit)
 
 
-def run_powershell(script: str) -> str:
-    """§5.1：-EncodedCommand（UTF-16LE→Base64）、CREATE_NO_WINDOW、8s 超时、shell=False。"""
+def resolve_powershell() -> str:
+    """返回标准 Windows PowerShell 绝对路径；找不到抛 ScanError。
+
+    R1 §6.1：只认 %SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe
+    （32 位进程可补 Sysnative 视图）；不回退 pwsh.exe 或 PATH 裸名。
+    """
+    try:
+        return _resolve_system32_tool(r"WindowsPowerShell\v1.0\powershell.exe")
+    except FileNotFoundError as e:
+        raise ScanError(str(e)) from e
+
+
+def run_powershell(script: str, *, timeout: float = PS_TIMEOUT,
+                   sta: bool = False) -> str:
+    """§5.1：-EncodedCommand（UTF-16LE→Base64）、CREATE_NO_WINDOW、8s 超时、shell=False。
+    R1 §6.1：命令名走 resolve_powershell() 的标准绝对路径；sta=True 仅用于授权窗口。"""
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    cmd = [
-        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded,
-    ]
+    cmd = [resolve_powershell(), "-NoLogo", "-NoProfile", "-NonInteractive",
+           "-ExecutionPolicy", "Bypass"]
+    if sta:
+        cmd.append("-STA")
+    cmd.extend(["-EncodedCommand", encoded])
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, timeout=PS_TIMEOUT,
+            cmd, capture_output=True, timeout=timeout,
             creationflags=CREATE_NO_WINDOW, shell=False,
         )
     except subprocess.TimeoutExpired as e:
@@ -1229,6 +1273,34 @@ class _AgentPortsGate:
             self._inflight -= 1
 
 
+class _AuthorizeGate:
+    """R1 §5.3：/agent/authorize 弹窗前限流。
+
+    按 (token HMAC 指纹, port) 分桶；每个进入扫描的尝试先计数，超限直接 429，
+    不扫描、不弹窗、不复用 try_consume_rate_slot，也不占真实 kill 配额。
+    取消/超时/扫描失败均不返还格子。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._buckets = {}
+
+    def try_acquire(self, fingerprint: str, port: int) -> bool:
+        now = time.monotonic()
+        key = (fingerprint, int(port))
+        with self._lock:
+            dq = self._buckets.get(key)
+            if dq is None:
+                dq = deque()
+                self._buckets[key] = dq
+            while dq and dq[0] < now - AUTHORIZE_RATE_WINDOW:
+                dq.popleft()
+            if len(dq) >= AUTHORIZE_RATE_LIMIT:
+                return False
+            dq.append(now)
+            return True
+
+
 def issue_force_ticket(state, target: dict, channel: str) -> str:
     """§6.3：ticket 绑定目标四元组、调用通道（S4，T-PORT-003 补齐）与 60 秒有效期，仅内存。
     复核建议 9：channel 必填——给了默认值等于把 S4 防的口子重新开开。"""
@@ -1259,6 +1331,58 @@ def consume_force_ticket(state, ticket: str, target: dict, channel: str) -> str:
                 or t["started"] != target["started"]):
             return "force_ticket_invalid"
         t["used"] = True
+        return ""
+
+
+def issue_user_grant(state, candidate: dict, *, channel: str, client_id: str) -> str:
+    """R1 §5.2：签发内存 grant，绑定端口+完整进程指纹+完整绑定地址集+通道+客户端。
+
+    grant 只存内存，60 秒、单次；不落盘、不回显 token。
+    """
+    grant_id = "ug_" + secrets.token_urlsafe(16)
+    now = time.monotonic()
+    with state.state_lock:
+        if len(state.user_grants) >= AUTHORIZE_GRANT_MAX:
+            for k in [k for k, v in state.user_grants.items()
+                      if v["used"] or v["expires"] <= now]:
+                state.user_grants.pop(k, None)
+        state.user_grants[grant_id] = {
+            "port": candidate["port"],
+            "pid": candidate["pid"],
+            "proc": candidate["proc"],
+            "started": candidate["started"],
+            "exe": candidate.get("exe", ""),
+            "addrs": sorted(candidate.get("addrs") or []),
+            "channel": channel,
+            "client_id": client_id,
+            "expires": now + AUTHORIZE_GRANT_TTL,
+            "used": False,
+        }
+    return grant_id
+
+
+def consume_user_grant(state, grant_id: str, target: dict, *, channel: str,
+                       port: int, addrs: list) -> str:
+    """返回 ""=通过；否则 user_grant_invalid。过期/复用/跨通道/跨端口/身份变化全拒。"""
+    with state.state_lock:
+        g = state.user_grants.get(grant_id or "")
+        if not g:
+            return "user_grant_invalid"
+        if g["used"] or g["expires"] < time.monotonic() or g.get("channel") != channel:
+            state.user_grants.pop(grant_id or "", None)
+            return "user_grant_invalid"
+        if (g["port"] != port or g["pid"] != target["pid"]
+                or g["proc"].casefold() != target["proc"].casefold()
+                or g["started"] != target["started"]
+                or not g.get("exe") or not target.get("exe")
+                or os.path.normcase(os.path.abspath(g["exe"]))
+                != os.path.normcase(os.path.abspath(target["exe"]))):
+            state.user_grants.pop(grant_id or "", None)
+            return "user_grant_invalid"
+        if sorted(g.get("addrs") or []) != sorted(addrs or []):
+            state.user_grants.pop(grant_id or "", None)
+            return "user_grant_invalid"
+        g["used"] = True
         return ""
 
 
@@ -1328,14 +1452,33 @@ def try_consume_rate_slot(state, channel: str) -> bool:
 # ----------------------------------------------------------------------------
 
 
+def resolve_taskkill() -> str:
+    """返回 %SystemRoot%\\System32\\taskkill.exe；不存在抛 TaskkillLaunchError。
+
+    R1 §6.2：不回退裸名、不从任意 PATH 挑选。32 位进程与 PowerShell 共用
+    Sysnative 视图口径。
+    """
+    try:
+        return _resolve_system32_tool(r"taskkill.exe")
+    except FileNotFoundError as e:
+        raise TaskkillLaunchError(str(e)) from e
+
+
 def run_taskkill(pid: int) -> tuple:
-    """taskkill /PID <pid> /T /F；返回码只代表命令执行结果，不代表端口释放。"""
-    cmd = ["taskkill", "/PID", str(pid), "/T", "/F"]
+    """taskkill /PID <pid> /T /F；返回码只代表命令执行结果，不代表端口释放。
+
+    R1 §6.2：解析/启动失败抛 TaskkillLaunchError，由 close_target 收口为
+    failed 审计 + 500 command_failed；已启动但非零返回仍走原有“等待退出 +
+    杀后重扫、以端口实检为最终裁决”。
+    """
+    cmd = [resolve_taskkill(), "/PID", str(pid), "/T", "/F"]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=TASKKILL_TIMEOUT,
                               creationflags=CREATE_NO_WINDOW, shell=False)
-    except (subprocess.TimeoutExpired, OSError) as e:
+    except subprocess.TimeoutExpired as e:
         return False, f"taskkill failed: {e}"
+    except OSError as e:
+        raise TaskkillLaunchError(f"taskkill spawn failed: {e}") from e
     if proc.returncode != 0:
         err = _extract_ps_stderr(proc.stderr, limit=200)
         return False, f"taskkill exit {proc.returncode}: {err}"
@@ -1397,6 +1540,8 @@ class AppState:
         # 能回答"应答的是不是写 runtime.json 的那个实例"。随进程生死，不落盘明文，
         # 只进 runtime.json 与 health 回显，不含任何可推断信息。
         self.instance_id = secrets.token_hex(8)
+        # R1 §5.3：authorize 限流桶的进程内 HMAC 键；只存在于内存，不落盘、不回显。
+        self.instance_random_key = secrets.token_bytes(32)
         self.token = token
         self.token_ok = token_ok
         self.started_at = time.monotonic()
@@ -1404,7 +1549,9 @@ class AppState:
         self.audit_lock = threading.Lock()
         self.tickets = {}        # ticket -> {port,pid,proc,started,expires,used}
         self.snapshots = {}      # port -> {sid,identity,expires}
-        self.kill_rate = {"ui": deque(), "agent": deque()}
+        self.user_grants = {}    # R1 §5.2：grant_id -> {port,pid,proc,started,exe,addrs,...}
+        self.kill_rate = {"ui": deque(), "agent": deque(), "local": deque()}
+        self.authorize_gate = _AuthorizeGate()  # R1 §5.3：弹窗前 6/60 限流
         self.agent_gate = _AgentPortsGate()  # 1.2 改-2：agent/ports 限流+在飞闸
         self.scan_cache = None   # 展示缓存槽 -> {data,at,cached_at_iso}（只喂 GET /ports）
         self.scan_cache_lock = threading.Lock()
@@ -1418,12 +1565,14 @@ def uptime_seconds(state) -> int:
     return int(time.monotonic() - state.started_at)
 
 
-def build_full_entries(state, scan: dict, *, record_unknowns: bool) -> list:
-    """完整端口条目（§5.4）。"""
+def build_full_entries(state, scan: dict, *, record_unknowns: bool,
+                       persist_mappings: bool = True) -> list:
+    """完整端口条目（§5.4）。
+    R1 §4.3：persist_mappings=False 供本地只读查询/候选展示使用，禁止补写 port_map.json。"""
     out = []
     for e in scan["entries"]:
         cls = classify_entry(state, e)
-        if cls["source"] == "manual":
+        if persist_mappings and cls["source"] == "manual":
             fill_mapping_fingerprint(state, e)
         level = cls["level"]
         reason = protection_reason(state, e)
@@ -1476,6 +1625,50 @@ def owner_groups(scan: dict, port: int) -> list:
     return groups
 
 
+def build_candidates(state, scan: dict, port: int, *, full: list | None = None) -> list:
+    """R1 §5.3/§4.4：完整候选指纹，供 authorize、by-port 409 与本地窗口共用。
+
+    只收必要身份字段；不返回 cmdline/token。同一 (pid, proc, started) 的多绑定
+    地址聚合到 addrs，addr 取排序后的第一个（保持旧字段兼容）。
+    """
+    if full is None:
+        full = build_full_entries(state, scan, record_unknowns=False,
+                                  persist_mappings=False)
+    by_pid = {}
+    for f in full:
+        by_pid.setdefault(f["pid"], f)
+    buckets, order = {}, []
+    for e in scan["entries"]:
+        if e["port"] != port:
+            continue
+        key = (e["pid"], e["proc"].casefold(), e["started"])
+        if key not in buckets:
+            buckets[key] = {"entry": e, "addrs": set()}
+            order.append(key)
+        buckets[key]["addrs"].add(e["addr"])
+    out = []
+    for key in order:
+        e = buckets[key]["entry"]
+        f = by_pid.get(e["pid"], {})
+        addrs = sorted(buckets[key]["addrs"])
+        out.append({
+            "port": e["port"],
+            "addr": addrs[0] if addrs else e["addr"],
+            "addrs": addrs,
+            "pid": e["pid"],
+            "proc": e["proc"],
+            "name": f.get("name", ""),
+            "level": f.get("level", "unknown"),
+            "source": f.get("source", "unknown"),
+            "started": e["started"],
+            "exe": e["exe"],
+            "session_id": e["session_id"],
+            "kill_allowed": bool(f.get("kill_allowed")),
+            "protected_reason": f.get("protected_reason", ""),
+        })
+    return out
+
+
 # ----------------------------------------------------------------------------
 # 关闭核心（§6）——UI 与 AI 共用同一 close_target
 # ----------------------------------------------------------------------------
@@ -1524,10 +1717,22 @@ def scan_or_error_cached(state, force_fresh: bool = False) -> dict:
 
 def parse_close_request(state, body: dict, mode: str, channel: str):
     """§6.1 步 3：字段类型与范围校验。布尔值不能冒充整数；字符串 "true" 不合格；
-    Agent 拒绝 force/force_ticket；按端口模式拒绝身份字段（acceptance 步 5）。"""
+    Agent 拒绝 force/force_ticket；按端口模式拒绝身份字段（acceptance 步 5）。
+    R1 §5.3：Agent strict 可携带 user_grant_id（多占用时由 /agent/authorize 下发）。"""
     port = body.get("port")
     if not is_int(port) or not (1 <= port <= 65535):
         return 400, "invalid_request", "port 非法", None
+
+    grant_id = None
+    if "user_grant_id" in body:
+        if channel != "agent":
+            return 400, "invalid_request", "user_grant_id 仅 Agent 通道可用", None
+        raw_grant = body.get("user_grant_id")
+        if (not isinstance(raw_grant, str) or len(raw_grant) > 96
+                or not re.fullmatch(r"ug_[A-Za-z0-9_-]{8,80}", raw_grant)):
+            return 400, "invalid_request", "user_grant_id 非法", None
+        grant_id = raw_grant
+
     if channel == "agent":
         # confirm 是 AI 通道（L2）的授权要件；UI 通道（L1）凭同源证据+两阶段，不带 confirm（§6.1 步1）
         if "confirm" not in body:
@@ -1553,8 +1758,12 @@ def parse_close_request(state, body: dict, mode: str, channel: str):
             return 400, "invalid_request", "严格模式必须携带 started 指纹（四元组才是唯一身份）", None
         if len(started) > 100:
             return 400, "invalid_request", "started 非法", None
-        return 0, "", "", {"port": port, "pid": pid, "proc": proc.strip(), "started": started.strip()}
-    for k in ("pid", "proc", "started"):
+        clean = {"port": port, "pid": pid, "proc": proc.strip(),
+                 "started": started.strip()}
+        if grant_id:
+            clean["user_grant_id"] = grant_id
+        return 0, "", "", clean
+    for k in ("pid", "proc", "started", "user_grant_id"):
         if k in body:
             return 400, "invalid_request", f"按端口模式不得携带身份字段 {k}", None
     sid = body.get("snapshot_id")
@@ -1563,10 +1772,47 @@ def parse_close_request(state, body: dict, mode: str, channel: str):
     return 0, "", "", {"port": port, "snapshot_id": sid}
 
 
-def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str) -> tuple:
+def target_addrs(scan: dict, port: int, target: dict) -> list:
+    """同一 (port,pid,proc,started) 的完整绑定地址集，排序后用于 grant/批准比对。"""
+    key = (target["pid"], target["proc"].casefold(), target["started"])
+    return sorted({e["addr"] for e in scan["entries"]
+                   if e["port"] == port
+                   and (e["pid"], e["proc"].casefold(), e["started"]) == key})
+
+
+def validate_local_approval(approval: dict | None, target: dict, *, port: int,
+                            addrs: list) -> str:
+    """R1 §5.6：local 通道的本机窗口批准必须绑定完整身份；缺失/变化一律拒绝。"""
+    if not isinstance(approval, dict):
+        return "local_authorization_required"
+    if approval.get("channel") != "local":
+        return "local_authorization_required"
+    if (not is_int(approval.get("port")) or approval["port"] != port
+            or not is_int(approval.get("pid")) or approval["pid"] != target["pid"]
+            or not isinstance(approval.get("proc"), str)
+            or approval["proc"].casefold() != target["proc"].casefold()
+            or not isinstance(approval.get("started"), str)
+            or not approval["started"] or approval["started"] != target["started"]
+            or not isinstance(approval.get("exe"), str)
+            or not approval["exe"] or not target.get("exe")
+            or os.path.normcase(os.path.abspath(approval["exe"]))
+            != os.path.normcase(os.path.abspath(target["exe"]))):
+        return "target_changed"
+    if sorted(approval.get("addrs") or []) != sorted(addrs or []):
+        return "target_changed"
+    return ""
+
+
+def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str,
+                 local_approval: dict | None = None) -> tuple:
     """§6.1/§6.2/§6.3 状态机核心。返回 (http_code, response_dict)。
-    任何校验不过都不触碰外部关闭命令（阶段 C 硬门槛）。"""
+    任何校验不过都不触碰外部关闭命令（阶段 C 硬门槛）。
+    R1 §5.6：新增 local_approval（本机窗口产生的完整指纹批准），不改 UI/旧 strict 路径。"""
     port = clean["port"]
+    audit_grant_id = ""
+    current_addrs = []
+    if channel == "local" and mode != "strict":
+        return 400, error_body("invalid_request", "local 通道只支持 strict 模式")
 
     # 步 4：新鲜扫描，禁用轮询缓存（硬要求 6）
     try:
@@ -1581,8 +1827,9 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
 
     # 步 5：解析目标
     if mode == "strict":
+        groups = owner_groups(scan, port)
         target = None
-        for e in owner_groups(scan, port):
+        for e in groups:
             if e["pid"] == clean["pid"]:
                 target = e
                 break
@@ -1603,6 +1850,41 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
                                    "缺少启动时间指纹，无法确认目标身份，请重新查询")
         if clean["started"] != target["started"]:
             return 409, error_body("target_changed", "启动时间与请求不符，目标可能已被复用")
+
+        current_addrs = target_addrs(scan, port, target)
+        current_multi = len(groups) > 1
+
+        # R1 §5.6：local 通道无论单/多占用，都必须有本机窗口批准；
+        # agent 只在当前多占用时消费 grant；旧 strict 单占用保持兼容。
+        if channel == "local":
+            approval_err = validate_local_approval(
+                local_approval, target, port=port, addrs=current_addrs)
+            if approval_err == "local_authorization_required":
+                return 409, error_body(
+                    "local_authorization_required",
+                    "本机关闭必须先经本机窗口授权（不接受命令行 --yes/--force）")
+            if approval_err:
+                return 409, error_body(
+                    "target_changed",
+                    "本机窗口批准与当前目标指纹不符（进程/启动时间/可执行路径/绑定地址已变化）")
+            audit_grant_id = (local_approval or {}).get("user_grant_id", "") or ""
+        elif channel == "agent" and current_multi:
+            grant_id = clean.get("user_grant_id") or ""
+            if not grant_id:
+                body = error_body(
+                    "user_authorization_required",
+                    "端口有多个占用者，必须先经本机窗口授权并携带 user_grant_id")
+                body["candidates"] = build_candidates(state, scan, port)
+                return 409, body
+            grant_err = consume_user_grant(
+                state, grant_id, target, channel="agent", port=port,
+                addrs=current_addrs)
+            if grant_err:
+                return 409, error_body(
+                    "user_grant_invalid",
+                    "授权 grant 缺失、过期、已复用、跨通道/跨端口或目标指纹不符，"
+                    "请重新调用 /agent/authorize")
+            audit_grant_id = grant_id
     else:
         groups = owner_groups(scan, port)
         if not groups:
@@ -1613,18 +1895,12 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
             }
         if len(groups) > 1:
             # §6.2 步 4：多占用者拒绝，优先于指纹校验（单测 40 / V40）
-            by_pid = {f["pid"]: f
-                      for f in build_full_entries(state, scan, record_unknowns=False)}
             body = error_body("multiple_owners",
                               "端口有多个占用者，请查询列表后用严格模式显式点名")
-            body["candidates"] = [{
-                "port": e["port"], "addr": e["addr"], "pid": e["pid"],
-                "proc": e["proc"], "name": by_pid.get(e["pid"], {}).get("name", ""),
-                "level": by_pid.get(e["pid"], {}).get("level", "unknown"),
-                "kill_allowed": by_pid.get(e["pid"], {}).get("kill_allowed", False),
-            } for e in groups]
+            body["candidates"] = build_candidates(state, scan, port)
             return 409, body
         target = groups[0]
+        current_addrs = target_addrs(scan, port, target)
         identity = {"port": port, "pid": target["pid"], "proc": target["proc"],
                     "started": target["started"]}
         if clean.get("snapshot_id"):
@@ -1678,8 +1954,10 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
     by_pid = {f["pid"]: f for f in build_full_entries(state, scan, record_unknowns=False)}
     t_full = by_pid.get(target["pid"], {})
     target_label = {"pid": target["pid"], "proc": target["proc"], "started": target["started"],
+                    "exe": target.get("exe", ""), "addrs": list(current_addrs),
                     "name": t_full.get("name", ""), "level": t_full.get("level", "unknown"),
                     "source": t_full.get("source", "unknown")}
+    target["addrs"] = list(current_addrs)
 
     # ---------------- UI 第一阶段：礼貌关窗（§6.4） ----------------
     if channel == "ui" and not clean.get("force"):
@@ -1775,10 +2053,13 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
     # 审计前置（复核建议 1：前置在扣费之前——already_free/复核拒绝出口不白扣配额；
     # 扣费点挪到本文件下方 taskkill 前的最后一刻，闸门计量的是"杀"，不是"请求"）
     try:
-        write_audit_event(state, {
+        started_event = {
             "ts": now_iso(), "channel": channel, "mode": "taskkill_tree", "port": port,
             "target": target_label, "client_id": client_id, "action": "started",
-        })
+        }
+        if audit_grant_id:
+            started_event["grant_id"] = audit_grant_id
+        write_audit_event(state, started_event)
     except OSError as e:
         print(f"[port-console] audit-pre-agent: {e}", file=sys.stderr)
         return 500, error_body("audit_write_failed", "操作未能执行，审计记录写入失败")
@@ -1795,7 +2076,8 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
     except Exception as e:
         write_audit_finished(state, channel, "taskkill_tree", port, target_label,
                              client_id, "failed", [], [],
-                             f"internal_error:{type(e).__name__}")
+                             f"internal_error:{type(e).__name__}",
+                             grant_id=audit_grant_id)
         return 500, error_body("internal_error", "杀前身份复核失败")
     if not pre_alive:
         # False 有两义：目标已自行退出（不用杀）vs PID 被复用（必须拒）。重扫分辨：
@@ -1803,7 +2085,8 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
             recheck = scan_or_error()
         except ScanError as e:
             write_audit_finished(state, channel, "taskkill_tree", port, target_label,
-                                 client_id, "failed", [], [], "scan_failed")
+                                 client_id, "failed", [], [], "scan_failed",
+                                 grant_id=audit_grant_id)
             print(f"[port-console] prekill-rescan: {e}", file=sys.stderr)
             return 500, error_body("scan_failed", "杀前复核失败，操作已中止")
         still = remaining_on_port(recheck, port)
@@ -1811,14 +2094,16 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
             # 目标已退且端口已空：意图已达成（非己力）。审计 result 用 "already_free"
             # （复核要点 4：与 API 响应同词，下游聚合不会误算成"成功强杀一次"）
             write_audit_finished(state, channel, "taskkill_tree", port, target_label,
-                                 client_id, "already_free", [], [], "port_free")
+                                 client_id, "already_free", [], [], "port_free",
+                                 grant_id=audit_grant_id)
             return 200, {"ok": True, "port": port, "already_free": True,
                          "target": {"pid": target["pid"], "proc": target["proc"],
                                     "started": target["started"]},
                          "killed": [], "remaining": [],
                          "message": "杀前复核发现目标已自行退出，端口已空闲"}
         write_audit_finished(state, channel, "taskkill_tree", port, target_label,
-                             client_id, "failed", [], still, "target_changed")
+                             client_id, "failed", [], still, "target_changed",
+                             grant_id=audit_grant_id)
         return 409, error_body("target_changed",
                                "杀前复核失败：目标 PID 已被复用或已变化，拒绝关闭，请重新查询")
 
@@ -1826,25 +2111,39 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
     #   （原位置在审计前置/B1 复核之前，already_free 与审计失败都会白扣配额）
     if not try_consume_rate_slot(state, channel):
         write_audit_finished(state, channel, "taskkill_tree", port, target_label,
-                             client_id, "failed", [], [], "rate_limited")
+                             client_id, "failed", [], [], "rate_limited",
+                             grant_id=audit_grant_id)
         return 429, error_body("rate_limited",
                                "触发 kill 频率闸（每分钟 6 次），请检查是否存在调用循环")
 
-    _ok, err = run_taskkill(target["pid"])
+    try:
+        _ok, err = run_taskkill(target["pid"])
+    except TaskkillLaunchError as e:
+        # R1 §6.2：解析/启动失败必须 fail closed；此时 taskkill 未启动，
+        # 不得进入等待/重扫，更不能在后续重扫为空时改判成功。
+        write_audit_finished(state, channel, "taskkill_tree", port, target_label,
+                             client_id, "failed", [], [],
+                             "taskkill_launch_failed", grant_id=audit_grant_id)
+        print(f"[port-console] taskkill-launch: {e}", file=sys.stderr)
+        return 500, error_body(
+            "command_failed",
+            "未能启动系统关闭命令（taskkill 标准路径缺失或无法执行），本次未执行关闭")
     try:
         alive = wait_tree_exit(tree_pids, KILL_VERIFY_WINDOW, started_map=started_map)
     except Exception as e:
         # 1.2 审计成对收口：taskkill 已执行，杀后验证轮询若抛异常，started 必须有 finished
         write_audit_finished(state, channel, "taskkill_tree", port, target_label,
                              client_id, "failed", [], [],
-                             f"internal_error:{type(e).__name__}")
+                             f"internal_error:{type(e).__name__}",
+                             grant_id=audit_grant_id)
         return 500, error_body("internal_error", "杀后存活验证失败")
     procs_by_pid = scan["processes"]
     try:
         final_scan = scan_or_error()
     except ScanError as e:
         write_audit_finished(state, channel, "taskkill_tree", port, target_label, client_id,
-                             "failed", [], [], "scan_failed")
+                             "failed", [], [], "scan_failed",
+                             grant_id=audit_grant_id)
         print(f"[port-console] postkill-rescan: {e}", file=sys.stderr)
         return 500, error_body("scan_failed", "强杀结果验证失败，请重新查询确认")
     still = remaining_on_port(final_scan, port)
@@ -1856,28 +2155,41 @@ def close_target(state, *, channel: str, mode: str, clean: dict, client_id: str)
     if not alive and not still:
         # T-PORT-003：taskkill 返回码进审计——非零也杀干净了时，200 但审计留痕
         write_audit_finished(state, channel, "taskkill_tree", port, target_label, client_id,
-                             "succeeded", killed, [], None if _ok else f"taskkill_rc:{err}")
-        return 200, success_body(port, target, killed, [], "进程树已结束，端口已释放")
+                             "succeeded", killed, [], None if _ok else f"taskkill_rc:{err}",
+                             grant_id=audit_grant_id)
+        return 200, success_body(
+            port, target, killed, [], "进程树已结束，端口已释放",
+            evidence_level=("local_clue" if channel == "local" else "authoritative"),
+            verification=("local_postkill_rescan" if channel == "local" else None))
     if target["pid"] in alive:
         write_audit_finished(state, channel, "taskkill_tree", port, target_label, client_id,
-                             "failed", killed, still, "command_failed")
+                             "failed", killed, still, "command_failed",
+                             grant_id=audit_grant_id)
         print(f"[port-console] taskkill: {err or '根进程仍存活'}", file=sys.stderr)
         body = error_body("command_failed", "强杀未生效：可能权限不足（需以管理员身份运行），或目标正在被系统占用")
         body["remaining"] = still
         return 500, body
     write_audit_finished(state, channel, "taskkill_tree", port, target_label, client_id,
-                         "failed", killed, still, "residual_listeners")
+                         "failed", killed, still, "residual_listeners",
+                         grant_id=audit_grant_id)
     body = error_body("residual_listeners", "目标进程已退出，但端口仍有占用")
     body["remaining"] = still
     return 409, body
 
 
-def success_body(port, target, killed, remaining, message) -> dict:
-    return {
+def success_body(port, target, killed, remaining, message, *,
+                 evidence_level="authoritative", verification=None) -> dict:
+    body = {
         "ok": True, "port": port, "already_free": False,
-        "target": {"pid": target["pid"], "proc": target["proc"], "started": target["started"]},
+        "target": {"pid": target["pid"], "proc": target["proc"],
+                   "started": target["started"], "exe": target.get("exe", ""),
+                   "addrs": sorted(target.get("addrs") or [])},
         "killed": killed, "remaining": remaining, "message": message,
+        "evidence_level": evidence_level,
     }
+    if verification:
+        body["verification"] = verification
+    return body
 
 
 def error_body(reason: str, message: str) -> dict:
@@ -1885,15 +2197,19 @@ def error_body(reason: str, message: str) -> dict:
 
 
 def write_audit_finished(state, channel, mode, port, target_label, client_id,
-                         result, killed, remaining, reason) -> None:
-    """结果事件写失败：控制台警告，不假装审计成功（§4.8）。"""
+                         result, killed, remaining, reason, grant_id="") -> None:
+    """结果事件写失败：控制台警告，不假装审计成功（§4.8）。
+    R1 §5.6：local/agent 多占用时，授权 ID 与 started/finished 同 ID 串联。"""
     try:
-        write_audit_event(state, {
+        event = {
             "ts": now_iso(), "channel": channel, "mode": mode, "port": port,
             "target": target_label, "client_id": client_id, "action": "finished",
             "result": result, "killed": killed, "remaining": remaining,
             "reason": reason,
-        })
+        }
+        if grant_id:
+            event["grant_id"] = grant_id
+        write_audit_event(state, event)
     except OSError as e:
         print(f"[port-console] ⚠ 审计结果事件写盘失败（真实结果={result}）: {e}", file=sys.stderr)
 
@@ -2164,7 +2480,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         ui_routes = {"/api/v1/ui/rename", "/api/v1/ui/kill",
                      "/api/v1/ui/protect", "/api/v1/ui/unprotect"}
         agent_routes = {"/api/v1/agent/kill": "strict",
-                        "/api/v1/agent/kill-by-port": "by_port"}
+                        "/api/v1/agent/kill-by-port": "by_port",
+                        "/api/v1/agent/authorize": "authorize"}
 
         if path in ui_routes:
             # 步 1：通道授权先于任何扫描（单测 22：403 不得触发扫描）
@@ -2199,6 +2516,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 http_code, resp = protect_port(state, body, self._client_id())
             elif path == "/api/v1/ui/unprotect":
                 http_code, resp = unprotect_port(state, body, self._client_id())
+            elif path == "/api/v1/agent/authorize":
+                http_code, resp = self._agent_authorize(state, body, self._client_id())
             else:
                 mode = agent_routes[path]
                 code2, reason2, msg2, parsed = parse_close_request(state, body, mode, "agent")
@@ -2267,6 +2586,101 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                               "data_scope": scan.get("_scope") or "full",
                               "refresh_ignored": refresh_ignored,
                               "warnings": state.warnings})
+
+    def _agent_authorize(self, state, body, client_id):
+        """R1 §5.3：多占用者本机窗口授权，返回一次性内存 grant。
+
+        顺序：字段白名单 → authorize 专用 6/60 闸（扫描前）→ 新鲜全量扫描 →
+        非多占用 409 → 完整候选 + 本机窗口 → 取消/超时/无交互拒绝 →
+        authorized 审计成功后才存 grant → 返回 grant_id（不回传 token）。
+        """
+        if not isinstance(body, dict) or set(body.keys()) != {"port"}:
+            return 400, error_body(
+                "invalid_request",
+                "authorize 请求体只允许 port；不得预选 pid/proc/started/exe/confirm/force")
+        port = body.get("port")
+        if not is_int(port) or not (1 <= port <= 65535):
+            return 400, error_body("invalid_request", "port 非法")
+
+        token = self.headers.get(TOKEN_HEADER, "")
+        fingerprint = hmac.new(state.instance_random_key, token.encode("utf-8"),
+                               hashlib.sha256).hexdigest()
+        if not state.authorize_gate.try_acquire(fingerprint, port):
+            return 429, error_body(
+                "rate_limited",
+                "授权请求超过每端口每分钟 6 次，本次不扫描、不弹窗、不占 kill 配额")
+
+        try:
+            scan = scan_or_error()
+        except ScanError as e:
+            print(f"[port-console] authorize-scan: {e}", file=sys.stderr)
+            return 500, error_body("scan_failed", "扫描失败，无法完成授权")
+
+        groups = owner_groups(scan, port)
+        if len(groups) <= 1:
+            return 409, error_body(
+                "not_multiple_owners",
+                "端口当前不是多占用者；单占用请直接取 snapshot_id 走严格模式，"
+                "无需本机窗口授权")
+
+        candidates = build_candidates(state, scan, port)
+        try:
+            import user_consent
+            index, consent_status = user_consent.ask_user(candidates)
+        except ImportError:
+            return 503, error_body(
+                "authorization_unavailable",
+                "本机授权窗口组件缺失（user_consent.py），本次未授权")
+        except Exception as e:
+            print(f"[port-console] authorize-consent: {e!r}", file=sys.stderr)
+            return 503, error_body(
+                "authorization_unavailable", "本机授权窗口不可用，本次未授权")
+
+        if consent_status == "unavailable":
+            return 503, error_body(
+                "authorization_unavailable", "当前无交互桌面，无法弹本机授权窗口")
+        if consent_status in ("cancelled", "timeout"):
+            return 409, error_body(
+                "authorization_cancelled",
+                "本机授权未完成（用户取消或窗口超时），本次未授权")
+        if consent_status != "selected":
+            return 409, error_body("authorization_cancelled", "本机授权窗口返回未知状态")
+        if not is_int(index) or not (0 <= index < len(candidates)):
+            return 409, error_body("authorization_cancelled", "本机授权窗口返回无效候选")
+        chosen = candidates[index]
+        if not chosen.get("kill_allowed"):
+            return 403, error_body(
+                "kill_not_allowed",
+                "所选目标受保护（kill_allowed=false），本机窗口不允许对其授权")
+
+        try:
+            grant_id = issue_user_grant(
+                state, chosen, channel="agent", client_id=client_id)
+            target_event = {
+                "port": chosen["port"], "pid": chosen["pid"],
+                "proc": chosen["proc"], "started": chosen["started"],
+                "exe": chosen.get("exe", ""), "addrs": list(chosen.get("addrs") or []),
+                "name": chosen.get("name", ""), "level": chosen.get("level", "unknown"),
+            }
+            write_audit_event(state, {
+                "ts": now_iso(), "channel": "agent", "mode": "authorize",
+                "port": port, "target": target_event, "client_id": client_id,
+                "action": "authorized", "grant_id": grant_id,
+                "candidates": candidates,
+            })
+        except OSError as e:
+            if "grant_id" in locals():
+                with state.state_lock:
+                    state.user_grants.pop(grant_id, None)
+            print(f"[port-console] authorize-audit: {e}", file=sys.stderr)
+            return 500, error_body("audit_write_failed", "授权审计写入失败，本次未授权")
+
+        return 200, {
+            "ok": True, "user_grant_id": grant_id,
+            "expires_in": int(AUTHORIZE_GRANT_TTL),
+            "target": target_event,
+            "evidence_level": "authoritative",
+        }
 
     def _handle_agent_ports(self, state):
         """§4.9 精简条目；port 过滤且唯一占用附 snapshot_id；多占用附 candidates。
@@ -2339,13 +2753,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                         for it in items:
                             it["snapshot_id"] = sid
                 elif len(groups) > 1:
-                    by_pid = {f["pid"]: f for f in full}
-                    resp["candidates"] = [{
-                        "port": e["port"], "addr": e["addr"], "pid": e["pid"],
-                        "proc": e["proc"], "name": by_pid.get(e["pid"], {}).get("name", ""),
-                        "level": by_pid.get(e["pid"], {}).get("level", "unknown"),
-                        "kill_allowed": by_pid.get(e["pid"], {}).get("kill_allowed", False),
-                    } for e in groups]
+                    resp["candidates"] = build_candidates(
+                        state, scan, int(port_filter), full=full)
         finally:
             state.agent_gate.leave_inflight()
         self._send_json(200, resp)

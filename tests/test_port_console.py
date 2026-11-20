@@ -901,11 +901,20 @@ class TestFixtureFiles(unittest.TestCase):
     def test_23_windowed_fixture_contract(self):
         f = Path(__file__).resolve().parent / "fixture_windowed.ps1"
         self.assertTrue(f.exists())
-        src = f.read_text(encoding="utf-8-sig", errors="replace")
+        raw = f.read_bytes()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+        src = raw.decode("ascii")
         self.assertIn("IgnoreCloseCount", src)
         self.assertIn("READY", src)
         self.assertIn("TcpListener", src)
         self.assertIn("System.Windows.Forms", src)
+        bat = Path(__file__).resolve().parent.parent / "启动端口控制台.bat"
+        bat_raw = bat.read_bytes()
+        self.assertFalse(bat_raw.startswith(b"\xef\xbb\xbf"))
+        self.assertIn(b"\r\n", bat_raw)
+        self.assertNotIn(b"\n", bat_raw.replace(b"\r\n", b""))
+        self.assertNotIn(b"goto :after", bat_raw)
+        self.assertIn(b":after", bat_raw)
         # acceptance 脚本性质：非零退出路径存在（单测 17 的可执行形态）
         a = Path(__file__).resolve().parent / "acceptance_api.py"
         self.assertTrue(a.exists())
@@ -2601,9 +2610,10 @@ class Test82StderrDecoding(unittest.TestCase):
 
     def test_82f_real_powershell_failure_end_to_end(self):
         """端到端（唯一有效判据）：真失败 PS 调用，ScanError 必须是人话，无 CLIXML 壳。"""
-        import shutil
-        if not shutil.which("powershell.exe"):
-            self.skipTest("无 powershell.exe")
+        try:
+            pc.resolve_powershell()
+        except pc.ScanError as exc:
+            self.skipTest(f"无绝对路径 powershell.exe: {exc}")
         with self.assertRaises(pc.ScanError) as cm:
             pc.run_powershell("Get-CimInstance -ClassName Win32_Bogus -ErrorAction Stop")
         msg = str(cm.exception)
@@ -2621,11 +2631,11 @@ class Test83ServerVersionHeader(ServerCase):
     def test_83_health_server_header_is_1_3(self):
         st, head, _ = http_req_raw("GET", "/api/v1/health")
         self.assertEqual(st, 200)
-        self.assertIn("server: portconsole/1.4.1", head.lower())
+        self.assertIn("server: portconsole/1.4.2", head.lower())
         self.assertNotIn("python/", head.lower())  # 加分项：解释器版本不外泄
 
     def test_83b_constant_locked(self):
-        self.assertEqual(pc.SERVER_VERSION, "PortConsole/1.4.1")
+        self.assertEqual(pc.SERVER_VERSION, "PortConsole/1.4.2")
 
     def test_83c_header_exact_no_trailing_space(self):
         """1.3 返工：锁住「响应头恰好等于常量」。
@@ -2635,8 +2645,8 @@ class Test83ServerVersionHeader(ServerCase):
         self.assertEqual(st, 200)
         for line in head.split("\n"):
             if line.lower().startswith("server:"):
-                self.assertEqual(line.split(":", 1)[1].strip(), "PortConsole/1.4.1")
-                self.assertEqual(line.rstrip("\r"), "Server: PortConsole/1.4.1")
+                self.assertEqual(line.split(":", 1)[1].strip(), "PortConsole/1.4.2")
+                self.assertEqual(line.rstrip("\r"), "Server: PortConsole/1.4.2")
                 break
         else:
             self.fail("响应头里没有 Server 行")
@@ -2925,7 +2935,7 @@ def free_port():
 
 
 class Test85PortDiscoveryIdentity(unittest.TestCase):
-    """单测 85：CLI 地址发现——认人、拒歧义、超时不悬挂。"""
+    """单测 85：CLI 地址发现——认人、拒歧义、超时不悬挂（1.4.2 结构化分型）。"""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="pctl-85-"))
@@ -2946,10 +2956,11 @@ class Test85PortDiscoveryIdentity(unittest.TestCase):
             live = h.server.server_address[1]
             with fake_http_server(body=b'{"hello":"world"}') as foreign:
                 self._cand([foreign, live])
-                err = io.StringIO()
-                with contextlib.redirect_stderr(err):
-                    self.assertEqual(pctl._discover(), (live, h.state.instance_id))
-                self.assertIn("未能确认身份", err.getvalue())
+                r = pctl._discover()
+                self.assertEqual(r.status, "online")
+                self.assertEqual(r.port, live)
+                self.assertEqual(r.instance_id, h.state.instance_id)
+                self.assertIn("未能确认身份", " ".join(r.warnings))
 
     def test_85b_claim_wins_without_scanning(self):
         with console_server() as h:
@@ -2965,7 +2976,10 @@ class Test85PortDiscoveryIdentity(unittest.TestCase):
 
             pctl._health = counted
             try:
-                self.assertEqual(pctl._discover(), (live, h.state.instance_id))
+                r = pctl._discover()
+                self.assertEqual(r.status, "online")
+                self.assertEqual(r.port, live)
+                self.assertEqual(r.instance_id, h.state.instance_id)
             finally:
                 pctl._health = real
             self.assertEqual(calls["n"], 1)     # 租约命中即返回，不再扫区间
@@ -2975,30 +2989,30 @@ class Test85PortDiscoveryIdentity(unittest.TestCase):
             live = h.server.server_address[1]
             write_claim(self.tmp, free_port(), 999999, "dead-instance")
             self._cand([free_port(), live])
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err):
-                self.assertEqual(pctl._discover(), (live, h.state.instance_id))
-            self.assertIn("未能确认身份", err.getvalue())
+            r = pctl._discover()
+            self.assertEqual(r.status, "online")
+            self.assertEqual(r.port, live)
+            self.assertIn("未能确认身份", " ".join(r.warnings))
 
     def test_85d_live_claim_with_other_instance_is_refused(self):
         with console_server() as h:
             live = h.server.server_address[1]
             write_claim(self.tmp, live, os.getpid(), "not-my-instance")
             self._cand([live])
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertIsNone(pctl._discover())
-            # 1.3 R2：拒绝原因记在 _REFUSED，由 _offline_exit 统一出口打印（不再与「不在线」打架）
-            self.assertIn("拒绝", pctl._REFUSED)
-            self.assertIn("另一个实例", pctl._REFUSED)
+            r = pctl._discover()
+            self.assertEqual(r.status, "instance_mismatch")
+            self.assertIsNone(r.port)
+            self.assertIn("拒绝", r.reason)
+            self.assertIn("另一个实例", r.reason)
 
     def test_85e_two_consoles_without_claim_is_refused(self):
         with console_server() as a, console_server() as b:
             p1 = a.server.server_address[1]
             p2 = b.server.server_address[1]
             self._cand([p1, p2])
-            with contextlib.redirect_stdout(io.StringIO()),                     contextlib.redirect_stderr(io.StringIO()):
-                self.assertIsNone(pctl._discover())
-            self.assertIn("无法判断", pctl._REFUSED)   # 拒绝原因由 _REFUSED 状态承载
+            r = pctl._discover()
+            self.assertEqual(r.status, "ambiguous")
+            self.assertIn("无法判断", r.reason)
 
     def test_85f_runtime_json_non_object_is_none(self):
         rt = self.tmp / "runtime.json"
@@ -3028,14 +3042,16 @@ class Test85PortDiscoveryIdentity(unittest.TestCase):
             with self.assertRaises(pctl.ConsoleChanged):
                 pctl._request("GET", "/api/v1/health", p, expect_instance="mine")
 
-    def test_85k_offline_message_names_range(self):
-        pctl._REFUSED = ""   # 套件隔离
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            self.assertEqual(pctl._offline_exit(), 1)
-        txt = buf.getvalue()
-        self.assertIn("3999~4098", txt)
-        self.assertIn("runtime.json", txt)
+    def test_85k_offline_health_names_range(self):
+        import local_ops
+        d = pctl.DiscoveryResult(status="not_found", checked={
+            "runtime_json": "missing", "api_token_txt": "missing",
+            "discovery_range": [3999, 4098], "discovery_attempts": 2})
+        result = local_ops.offline_health(self.tmp, d)
+        self.assertEqual(result["status"], "console_unavailable")
+        self.assertEqual(result["checked"]["discovery_range"], [3999, 4098])
+        self.assertEqual(result["checked"]["runtime_json"], "missing")
+        self.assertIn("不等于", " ".join(result["local_clues"]))
 
 
 
@@ -3193,15 +3209,14 @@ class Test87DocsDiscovery(unittest.TestCase):
         self.assertIn("Never scan ports to find the service yourself", skill)
 
     def test_87d_doc_test_counts_match_reality(self):
-        """红门 C-2（1.3 R2 修改单；1.4 口径反转）：md 里「N 单测」必须等于测试函数个数。
+        """红门 C-2（1.4.2）：md 里的当前单测数必须等于 discover 全量计数。
 
-        1.4 只查「当前段」：CHANGELOG.md 里第一个「## 数字」版本标题到第二个版本标题
-        之间算当前段；第二个版本标题起一律不查（历史段不按值放行、不比较）；文件头
-        （第一个标题之前）不查。CHANGELOG.md 之外的 md 没有版本段，整份照查。
-        英文口径（N unit tests）一并把守。
+        R1 §9.2 口径：用 TestLoader.discover(tests, test*.py) 的 countTestCases，
+        不再只数 test_port_console.py 的 def test_。CHANGELOG 只查当前版本段；
+        历史 159 标注必须同时出现 test_port_console.py 与 1.4.0/1.4.1/基线/历史/旧。
         """
-        src = Path(__file__).read_text(encoding="utf-8")
-        actual = len(re.findall("def " + "test_" + r"\w+", src))
+        suite = unittest.TestLoader().discover(str(_PKG / "tests"), pattern="test*.py")
+        actual = suite.countTestCases()
         pats = (
             re.compile(r"(" + r"\d+" + r")\s*[项个]?\s*单测"),
             re.compile(r"单测\s*(\d+)\s*(?:个|项|→|＋)"),
@@ -3216,14 +3231,19 @@ class Test87DocsDiscovery(unittest.TestCase):
                 if heads:
                     cur_from = heads[0]
                     cur_to = heads[1] if len(heads) > 1 else len(txt)
+            lines = txt.splitlines()
             for pat in pats:
                 for mm in pat.finditer(txt, cur_from, cur_to):
                     num = mm.group(1)
                     if num == str(actual):
                         continue
                     line_no = txt[:mm.start()].count("\n") + 1
+                    line = lines[line_no - 1] if line_no <= len(lines) else ""
+                    if ("test_port_console.py" in line
+                            and any(k in line for k in ("1.4.0", "1.4.1", "基线", "历史", "旧"))):
+                        continue  # 历史注释允许保留 159
                     self.fail(f"{md.relative_to(_PKG).as_posix()}:{line_no} "
-                              f"写「{num} 单测」与实际 {actual} 不符")
+                              f"写「{num} 单测」与 discover 实际 {actual} 不符")
 
 
 
@@ -3242,20 +3262,24 @@ class Test88RangeSingleSource(unittest.TestCase):
 
 
 class Test89OfflineOutlet(unittest.TestCase):
-    """单测 89：五个命令共用一个"不在线"出口（P-13）。"""
+    """单测 89：离线出口统一到 local_ops，不再有 1.3 的单一死出口。"""
 
     def test_89a_single_offline_message_source(self):
         src = Path(pctl.__file__).read_text(encoding="utf-8")
-        self.assertEqual(src.count("控制台不在线"), 1)
+        self.assertNotIn("def " + "_offline_exit", src)
+        self.assertIn("local_ops.offline_health", src)
+        self.assertIn("local_ops.offline_query", src)
+        self.assertIn("local_ops.offline_kill", src)
 
     def test_89b_message_names_range_and_claim(self):
-        pctl._REFUSED = ""   # 套件隔离：清掉前面用例残留的拒绝文案
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            self.assertEqual(pctl._offline_exit(), 1)
-        txt = buf.getvalue()
-        self.assertIn("3999~4098", txt)
-        self.assertIn("runtime.json", txt)
+        d = pctl.DiscoveryResult(
+            status="instance_mismatch", reason="runtime.json 记的实例还活着",
+            checked={"runtime_json": "present", "api_token_txt": "missing",
+                     "discovery_range": [3999, 4098], "discovery_attempts": 2})
+        res = pctl._offline_unavailable("find", d, d.reason)
+        self.assertEqual(res["checked"]["discovery_range"], [3999, 4098])
+        self.assertEqual(res["checked"]["runtime_json"], "present")
+        self.assertIn("实例", res["message"])
 
     def test_89c_helper_functions_defined_once(self):
         """红门 C-1（1.3 R2 修改单）：辅助函数区只许一份，复制一份即红。
@@ -3328,4 +3352,159 @@ class Test90TmpAndMask(unittest.TestCase):
         src = a.read_text(encoding="utf-8")
         self.assertEqual(src.count("tok[:4]"), 0)
         self.assertEqual(src.count("mask_token(tok)"), 2)
+
+
+# ----------------------------------------------------------------------------
+# 单测 92（1.4.2）：authorize 限流/grant/local 批准/绝对路径
+# ----------------------------------------------------------------------------
+
+
+class Test92Authorize(ServerCase):
+    """R1 §5.3/§6.2：弹窗前限流、grant 绑定、local 批准、绝对路径 fail closed。"""
+
+    SCAN = make_scan(
+        [conn("0.0.0.0", 3084, 1234), conn("127.0.0.1", 3084, 5678)],
+        [proc(1234), proc(5678, name="other.exe", exe=r"C:\Other\other.exe")],
+        {"1234": 1, "5678": 1})
+
+    def _cand(self, port=3084, pid=1234, proc_name="python.exe",
+              started="2026-11-01T10:00:00+08:00", exe=r"C:\Python\python.exe",
+              addrs=None):
+        return {"port": port, "pid": pid, "proc": proc_name, "started": started,
+                "exe": exe, "addrs": list(addrs or ["0.0.0.0"])}
+
+    def _post_authorize(self, body):
+        return http_req("POST", "/api/v1/agent/authorize", body, AGENT_HDR)
+
+    def test_92a_body_whitelist_400_no_scan(self):
+        with mock.patch.object(pc, "scan_or_error") as scan:
+            st, obj = self._post_authorize({"port": 3084, "pid": 1234})
+        self.assertEqual(st, 400)
+        self.assertEqual(obj["reason"], "invalid_request")
+        scan.assert_not_called()
+
+    def test_92b_seventh_authorize_is_429_before_scan(self):
+        import user_consent
+        scan = pc.normalize_snapshot(self.SCAN)
+        calls = {"scan": 0}
+
+        def fake_scan():
+            calls["scan"] += 1
+            return scan
+
+        with mock.patch.object(pc, "scan_or_error", side_effect=fake_scan), \
+             mock.patch.object(user_consent, "ask_user",
+                               return_value=(0, "selected")) as ask:
+            for _ in range(pc.AUTHORIZE_RATE_LIMIT):
+                st, obj = self._post_authorize({"port": 3084})
+                self.assertEqual(st, 200, obj)
+                self.assertTrue(obj["user_grant_id"].startswith("ug_"))
+            st, obj = self._post_authorize({"port": 3084})
+        self.assertEqual(st, 429)
+        self.assertEqual(obj["reason"], "rate_limited")
+        self.assertEqual(calls["scan"], pc.AUTHORIZE_RATE_LIMIT)
+        self.assertEqual(ask.call_count, pc.AUTHORIZE_RATE_LIMIT)
+
+    def test_92c_grant_single_use_expiry_and_binding(self):
+        state = self.h.state
+        target = self._cand()
+        gid = pc.issue_user_grant(state, target, channel="agent", client_id="c")
+        self.assertEqual(pc.consume_user_grant(state, gid, target, channel="agent",
+                                               port=3084, addrs=["0.0.0.0"]), "")
+        self.assertEqual(pc.consume_user_grant(state, gid, target, channel="agent",
+                                               port=3084, addrs=["0.0.0.0"]),
+                         "user_grant_invalid")
+
+        gid = pc.issue_user_grant(state, target, channel="agent", client_id="c")
+        state.user_grants[gid]["expires"] = time.monotonic() - 1
+        self.assertEqual(pc.consume_user_grant(state, gid, target, channel="agent",
+                                               port=3084, addrs=["0.0.0.0"]),
+                         "user_grant_invalid")
+
+        gid = pc.issue_user_grant(state, target, channel="local", client_id="c")
+        self.assertEqual(pc.consume_user_grant(state, gid, target, channel="agent",
+                                               port=3084, addrs=["0.0.0.0"]),
+                         "user_grant_invalid")
+
+        gid = pc.issue_user_grant(state, target, channel="agent", client_id="c")
+        changed = dict(target, exe=r"C:\Other\python.exe")
+        self.assertEqual(pc.consume_user_grant(state, gid, changed, channel="agent",
+                                               port=3084, addrs=["0.0.0.0"]),
+                         "user_grant_invalid")
+
+        gid = pc.issue_user_grant(state, target, channel="agent", client_id="c")
+        self.assertEqual(pc.consume_user_grant(state, gid, target, channel="agent",
+                                               port=3084, addrs=["0.0.0.0", "127.0.0.1"]),
+                         "user_grant_invalid")
+
+    def test_92d_local_channel_requires_approval_and_returns_local_clue(self):
+        scan = pc.normalize_snapshot(self.SCAN)
+        target = pc.owner_groups(scan, 3084)[0]
+        clean = {"port": 3084, "pid": target["pid"], "proc": target["proc"],
+                 "started": target["started"]}
+        with mock.patch.object(pc, "scan_or_error", return_value=scan), \
+             mock.patch.object(pc, "run_taskkill") as tk:
+            st, obj = pc.close_target(self.h.state, channel="local", mode="strict",
+                                      clean=clean, client_id="local-test")
+        self.assertEqual((st, obj["reason"]), (409, "local_authorization_required"))
+        tk.assert_not_called()
+
+        approval = dict(self._cand(pid=target["pid"], proc_name=target["proc"],
+                                   started=target["started"], exe=target["exe"],
+                                   addrs=[target["addr"]]),
+                        channel="local", user_grant_id="lg_test_approval")
+        empty = pc.normalize_snapshot(make_scan([]))
+        with mock.patch.object(pc, "scan_or_error", side_effect=[scan, empty]), \
+             mock.patch.object(pc, "pid_matches_start", return_value=True), \
+             mock.patch.object(pc, "run_taskkill", return_value=(True, "")) as tk, \
+             mock.patch.object(pc, "wait_tree_exit", return_value=[]):
+            st, obj = pc.close_target(self.h.state, channel="local", mode="strict",
+                                      clean=clean, client_id="local-test",
+                                      local_approval=approval)
+        self.assertEqual(st, 200, obj)
+        self.assertEqual(obj["evidence_level"], "local_clue")
+        self.assertEqual(obj["verification"], "local_postkill_rescan")
+        tk.assert_called_once()
+
+    def test_92e_taskkill_launch_failure_fail_closed(self):
+        scan = pc.normalize_snapshot(self.SCAN)
+        target = pc.owner_groups(scan, 3084)[0]
+        clean = {"port": 3084, "pid": target["pid"], "proc": target["proc"],
+                 "started": target["started"]}
+        approval = dict(self._cand(pid=target["pid"], proc_name=target["proc"],
+                                   started=target["started"], exe=target["exe"],
+                                   addrs=[target["addr"]]),
+                        channel="local", user_grant_id="lg_test_approval")
+        with mock.patch.object(pc, "scan_or_error", return_value=scan), \
+             mock.patch.object(pc, "pid_matches_start", return_value=True), \
+             mock.patch.object(pc, "run_taskkill",
+                               side_effect=pc.TaskkillLaunchError("missing")), \
+             mock.patch.object(pc, "wait_tree_exit") as wait:
+            st, obj = pc.close_target(self.h.state, channel="local", mode="strict",
+                                      clean=clean, client_id="local-test",
+                                      local_approval=approval)
+        self.assertEqual((st, obj["reason"]), (500, "command_failed"))
+        wait.assert_not_called()
+        lines = self.h.audit_lines()
+        self.assertTrue(any(x.get("action") == "finished"
+                            and x.get("reason") == "taskkill_launch_failed"
+                            for x in lines), json.dumps(lines, ensure_ascii=False))
+
+    def test_92f_absolute_tools_never_fall_back_to_path(self):
+        self.assertTrue(os.path.isabs(pc.resolve_powershell()))
+        self.assertTrue(os.path.isabs(pc.resolve_taskkill()))
+        self.assertTrue(pc.resolve_taskkill().lower().endswith("taskkill.exe"))
+        with mock.patch.dict(os.environ, {"SystemRoot": r"C:\__no_such_system_root__"}), \
+             mock.patch("shutil.which", return_value=r"C:\fake\taskkill.exe"):
+            with self.assertRaises(pc.ScanError):
+                pc.resolve_powershell()
+            with self.assertRaises(pc.TaskkillLaunchError):
+                pc.resolve_taskkill()
+        with mock.patch.object(pc.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stderr = b""
+            pc.run_taskkill(1234)
+            self.assertTrue(os.path.isabs(run.call_args[0][0][0]))
+            pc.run_powershell("Get-Date")
+            self.assertTrue(os.path.isabs(run.call_args[0][0][0]))
 

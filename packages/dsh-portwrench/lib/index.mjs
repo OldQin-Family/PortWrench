@@ -75,7 +75,7 @@ function guide(msg) {
       <p>已自动探测本机 \${PW_BASE}–\${PW_MAX}（与本体端口顺延范围一致），没有发现在线实例。</p>
       <p>PortWrench 是一个独立程序，需要先在你自己的机器上跑起来：</p>
       <ol>
-        <li>从 <a href="https://github.com/OldQin-Aurora001/portwrench/releases" target="_blank">GitHub Releases</a> 下载 zip</li>
+        <li>从 <a href="https://github.com/OldQin-Family" target="_blank">OldQin-Family 发布页</a> 获取最新版</li>
         <li>解压到任意目录，双击 <code>启动端口控制台.bat</code></li>
         <li>回到这里，点下面这个按钮重新检测</li>
       </ol>

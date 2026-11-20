@@ -6,7 +6,7 @@ English · [中文](README.md)
 
 # PortWrench
 
-> **Current version: 1.4.1** (patch release; zero product logic changes)
+> **Current version: 1.4.2** (offline evidence loop, explicit local authorization, absolute tool paths)
 
 This is the English translation of README.md. If there is any inconsistency, the Chinese version prevails.
 
@@ -78,6 +78,8 @@ A tool that can be used often must not only be handy; more importantly, it must 
 ## How it works
 
 Three diagrams, split by the angle you care about: **how a person uses it** / **how an AI uses it** / **when it refuses**. Click a thumbnail for the full-size image; text on the diagrams is illustrative — **the README body is the detail source of truth**.
+
+> Flow diagrams depict the 1.4.1 main flow; since 1.4.2, online multi-owner and offline close add a local consent-window step (see §2 and §6). Diagrams will be redrawn next release.
 
 **① For people** — double-click → view the table → two confirmations → clean exit (it is not a one-click kill-all):
 
@@ -259,7 +261,9 @@ It also provides a stable loopback HTTP API for local AI clients such as ZCode a
 ## 2. Closing capability and two confirmations
 
 - UI channel: two stages. It first attempts a normal window close (`WM_CLOSE`); only if that does not complete is a force kill allowed, and force kill requires a second confirmation.
-- AI channel: a single direct operation with an admin token and `confirm:true`. It still performs a fresh scan before killing, verifies identity, checks system and process-tree protections, and verifies the result afterward—**only human approval is skipped; no safety checks are**.
+- Online single owner: use an admin token, `confirm:true`, and a valid `snapshot_id`/fingerprint. Fresh pre-kill scanning, identity verification, system/process-tree protections and post-kill verification remain mandatory.
+- Online multiple owners: call `/api/v1/agent/authorize` first. The local authorization window lets the user choose a candidate and returns a one-time `user_grant_id`; agent-supplied `pid/proc/started` fields are not user authorization.
+- Offline scenarios: local snapshots from `local_ops.py` are marked `local_clue`; local closure requires the local authorization window. They are not console API evidence and do not prove that a port is free.
 - **Never supported**: one-click kill-all, cleanup by process name, bulk closure by ownership, or operations on processes with no listening port.
 - Closing applies only to the process tree whose root is currently listening on the specified port; the entire tree is killed (`taskkill /T /F`).
 
@@ -280,8 +284,9 @@ It also provides a stable loopback HTTP API for local AI clients such as ZCode a
 
 ## 4. token and credential security
 
-- `api_token.txt` is the only credential for **L2 programmatic closure**; it is generated on first launch (`token_urlsafe(32)`).
-- It is **equivalent to authorization on this machine**: do not commit it, screenshot it, put it in a shared directory, or include it in any file that will be sent out.
+- `api_token.txt` is the credential for the **L2 programmatic channel**; it is generated on first launch (`token_urlsafe(32)`).
+- A token proves the caller may use the programmatic channel; it is **not one-time user authorization for a specific target**. Multiple owners still require `user_grant_id`.
+- Do not commit it, screenshot it, put it in a shared directory, or include it in any file that will be sent out.
 - Tokens are accepted only in the `X-Port-Console-Token` request header; tokens in URLs are always rejected; comparison uses a constant-time function.
 - Tokens do not appear in any API response, `runtime.json`, page, or log.
 - To rotate: stop the console → delete or replace `api_token.txt` → restart → update authorized AI clients.
@@ -370,18 +375,24 @@ GET /api/v1/ports                  # full entries (command lines are redacted by
 ### 6.3 Closing: the fixed rule "check first, then kill"
 
 ```
-GET  /api/v1/agent/ports?port=X     → check name/level/kill_allowed, confirm this is the target to clear
+# Single owner: check first, then kill
+GET  /api/v1/agent/ports?port=X     → check name/level/kill_allowed, obtain snapshot_id
 POST /api/v1/agent/kill-by-port     {"port":X,"snapshot_id":"<from the previous step>","confirm":true}
+
+# Multiple owners: local authorization first, then strict closure
+POST /api/v1/agent/authorize        {"port":X}
+     → local window selects a candidate and returns user_grant_id
+POST /api/v1/agent/kill             {"port":X,"pid":...,"proc":...,"started":...,"confirm":true,"user_grant_id":"<from the previous step>"}
 Header: X-Port-Console-Token: <token>   (optional X-Port-Console-Client: zcode/dsh/...)
 ```
 
 - Port already empty → `ok=true, already_free=true` (idempotent; retry logic can stop here);
-- Multiple owners → `409 multiple_owners` + `candidates`: **never choose automatically**,  
-  go back to GET and inspect the list. If a specific target must be named, use strict mode: `POST /api/v1/agent/kill {port,pid,proc,started,confirm:true}`;
+- Multiple owners → `409 multiple_owners` + `candidates`: **never choose automatically**; call `/agent/authorize` for the user's local choice instead of selecting a candidate as the agent;
+- Cancelled/timed-out/non-interactive authorization → no `user_grant_id`, no closure;
+- Too many authorization requests → `429 rate_limited`; no scan or popup;
 - Fingerprint missing/expired → `400 target_identity_required` (GET again to obtain the fingerprint);
-- Port changed owners → `409 target_changed` (confirm again; do not force it);
+- Port changed owners, grant reuse, or changed binding data → `409 target_changed`/authorization refusal (re-confirm; do not force it);
 - Protected → `403 kill_not_allowed` (**do not try again**);
-- Rate limit reached → `429 rate_limited` (maximum 6 real force kills per channel per minute; `already_free` does not count).
 - The operation is complete only when `ok=true` and `remaining=[]`.
 
 ### 6.4 Caller tag
@@ -446,7 +457,7 @@ The phase-two "pure ctypes rewrite" is unrelated to this metric; use "2.0 / ctyp
 - **Tests**: run unit tests with `python -m unittest discover -s tests -v`;  
   after starting the service, run automated acceptance tests with `python tests\acceptance_api.py --base-url http://127.0.0.1:3999 --token-file api_token.txt`  
   (the script creates its own test processes and does not touch real services).
-- Antivirus false-positive notice: `tests\test_port_console.py` contains decoy "masqueraded system process path" data used by the tests (fake svchost.exe paths outside the system directory — PortWrench must recognize and refuse such masquerades, and these entries exist to verify exactly that). Some antivirus products may flag this file statically (historical confirmed case: Huorong Trojan/Python.ShellLoader.ad, against test files prior to this release). This does not affect any product feature: `tests\` is used by unit tests only and is not used at runtime. If flagged, add the file to the trust list or ignore it; this release rewrites that test data, and the full 159-test suite passes on Python 3.12 with Huorong enabled, with zero file loss. Other antivirus products have not been verified one by one. Skipping unit tests avoids the issue entirely.
+- Antivirus false-positive notice: `tests\test_port_console.py` contains decoy "masqueraded system process path" data used by the tests (fake svchost.exe paths outside the system directory — PortWrench must recognize and refuse such masquerades, and these entries exist to verify exactly that). Some antivirus products may flag this file statically (historical confirmed case: Huorong Trojan/Python.ShellLoader.ad, against test files prior to this release). This does not affect any product feature: `tests\` is used by unit tests only and is not used at runtime. If flagged, add the file to the trust list or ignore it; this release rewrites that test data, and the full 174-test suite passes on Python 3.12 with Huorong enabled, with zero file loss (1.4.1 baseline had 159 test functions in `tests/test_port_console.py`; the 1.4.2 `discover` total is 174). Other antivirus products have not been verified one by one. Skipping unit tests avoids the issue entirely.
 
 ## Directory structure (release build)
 

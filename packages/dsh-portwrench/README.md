@@ -13,7 +13,7 @@ PortWrench（端口扳手）的 DSH 插件壳：在 **DSH 设置 → 插件** �
 
 ## 使用三步
 
-1. 从 [PortWrench Releases](https://github.com/OldQin-Aurora001/portwrench/releases)
+1. 从 [PortWrench Releases](https://github.com/OldQin-Family)
    下载 zip，解压到任意目录；
 2. 双击 `启动端口控制台.bat`（Windows、Python 3.10+；默认 `http://127.0.0.1:3999/`，被占自动顺延）；
 3. 回到 DSH 设置 → 插件 →「端口扳手」，面板会自动检测并嵌入 UI。
@@ -53,8 +53,8 @@ PortWrench 未运行时，面板显示引导页（不会白屏）。
 ## 隐私与安全
 
 - 只监听 `127.0.0.1`，绝不开放外网；不做开机自启、不写注册表、不改防火墙。
-- 关闭动作全部落审计日志；`api_token.txt` 等同本机授权，不随壳分发。
+- 关闭动作全部落审计日志；`api_token.txt` 是程序化通道凭据，不随壳分发；多占用仍需本机授权和一次性 `user_grant_id`。
 
 ## 来源
 
-- 本体与设计：[PortWrench](https://github.com/OldQin-Aurora001/portwrench)（MIT）
+- 本体与设计：[PortWrench](https://github.com/OldQin-Family)（MIT）

@@ -4,6 +4,34 @@
 
 ---
 
+## [1.4.2] · 2026-11-20 · 离线证据闭环＋显式授权＋绝对路径
+
+### Added（1.4.2 本轮）
+
+- **离线本地证据闭环**：控制台未发现时，`portctl.py` 走 `local_ops.py` 只读快照/查询/本地关闭；所有离线结果统一标注 `local_clue`，不冒充控制台 API 证据，不宣称进程死亡或端口空闲。
+- **显式本机授权窗口**：新增 `user_consent.py`（Windows PowerShell + WinForms）。本机 kill 无论单/多占用都必须由窗口逐项选择；候选保护项禁选，取消/超时/无交互均未授权。
+- **多占用者 grant**：`/api/v1/agent/authorize` 只接受 `{"port"}`，扫描前按 token HMAC + port 限流（6 次/60 秒，第 7 次 429）；窗口选择成功后签发一次性、60 秒、通道/端口/完整进程指纹/绑定地址集绑定的 `user_grant_id`，不回落 token。
+- **完整候选指纹**：新增 `build_candidates`，聚合 `(pid, proc, started)` 与完整 `addrs`，不含 cmdline/token；authorize、by-port 409 与本地窗口共用。
+
+### Changed（1.4.2 本轮）
+
+- **PowerShell 绝对路径**：`resolve_powershell()` 只认 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`，32 位进程补 `Sysnative`；不回退 `pwsh` 或 PATH。
+- **taskkill 绝对路径 fail closed**：`resolve_taskkill()` 只认 `%SystemRoot%\System32\taskkill.exe`；解析/启动失败写 `finished/failed`（`taskkill_launch_failed`）并立即 500 `command_failed`，不等待、不重扫、不改判成功。
+- **本地关闭复用同一安全内核**：`close_target(channel="local", mode="strict")` 校验完整指纹批准；成功返回 `evidence_level=local_clue`、`verification=local_postkill_rescan`。
+- **87d 动态计数**：文档当前单测数改为 `TestLoader.discover(tests, test*.py)` 全量计数；159 仅作为“1.4.1 基线时 test_port_console.py 内数量”的历史标注。
+- **测试夹具去 BOM**：`fixture_windowed.ps1` 注释改为纯 ASCII 并移除 UTF-8 BOM；PowerShell 5.1 不再依赖 BOM 识别中文，静态测试同时断言无 BOM、全文件 ASCII，运行逻辑不变。
+- **启动批处理修复**：`启动端口控制台.bat` 移除括号块内 `goto`，改为嵌套 if/else；该文件按 Windows 平台惯例使用 CRLF 且无 BOM，其余发布文本继续保持 LF。
+- **验收缓存时序稳定**：21 步 acceptance 进入缓存步骤前用单调时钟等待至少 5.5 秒，确保展示缓存自然过期，避免前序请求在 5 秒窗口内造成时序误报。
+- **文档授权口径同步**：README 中英、SKILL 与使用说明补入多占用 `/agent/authorize`、一次性 `user_grant_id`、离线 `local_clue` 和本机授权流程；token 不再表述为具体目标授权。
+- **版本字样**：Server 头、README 中英、SKILL frontmatter、使用说明、DEVELOPMENT 尾注、FINGERPRINTS 头统一到 1.4.2。
+
+### Tests（1.4.2 本轮）
+
+- `unittest discover -s tests` 全量 **174 个单测**；新增离线 CLI 契约 9 例、authorize/grant/local/绝对路径 6 例。21 步 acceptance、空 PATH 全量门与本机人工授权记录均已在 225 实测归档（见 `_落码工作记录`）。
+- 发布根新增 `local_ops.py`、`user_consent.py`、`tests/test_portctl.py` 三件；指纹清单 56 件，含表自身整包 57 件。
+
+---
+
 ## [1.4.1] · 2026-11-06 · 纯补丁：测试告警与文档更正
 
 ### Changed（1.4.1 本轮）
@@ -413,4 +441,4 @@
 
 ---
 
-*CHANGELOG · PortWrench 端口扳手 · 最后更新 2026-11-06（最新已发布 1.4.0）*
+*CHANGELOG · PortWrench 端口扳手 · 最后更新 2026-11-20（最新已发布 1.4.2）*

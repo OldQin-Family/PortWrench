@@ -1,8 +1,8 @@
 # PortWrench 端口扳手
 
-> Windows 本机的端口管家：让人和 AI 都能一句话看清哪个端口被谁占、能不能关，并在动手前确认「它还是不是原来那个」。只绑 127.0.0.1、不联网、零第三方依赖。版本 1.4.1。
+> Windows 本机的端口管家：让人和 AI 都能一句话看清哪个端口被谁占、能不能关，并在动手前确认「它还是不是原来那个」。只绑 127.0.0.1、不联网、零第三方依赖。版本 1.4.2。
 
-> **版本口径**：当前版本 1.4.1，[FINGERPRINTS.md](FINGERPRINTS.md) 抬头即 1.4.1，与代码 `SERVER_VERSION = "PortConsole/1.4.1"` 一致。
+> **版本口径**：当前版本 1.4.2，[FINGERPRINTS.md](FINGERPRINTS.md) 抬头即 1.4.2，与代码 `SERVER_VERSION = "PortConsole/1.4.2"` 一致。
 
 > 本文件是给 AI 读者的**事实与边界说明**，不是操作手册、不是功能广告。它是**索引与边界，不是真源**——功能与安全行为以 [README.md](README.md) 为准，操作口径以 [SKILL.md](SKILL.md) 为准，实际行为以 [port_console.py](port_console.py) 真码为准。
 
@@ -26,9 +26,9 @@
 |---|---|---|
 | `403 kill_not_allowed` | 命中保护线——受保护目标、Session 0、System32 宿主、信息读不到（fail closed）、用户手动保护 | **不要再试**，说明这是保护线，不是故障 |
 | `409 target_changed` | 端口易主 / PID 复用（扫描到动手之间那几百毫秒） | **重新确认**，别拿旧快照追杀新进程 |
-| `409 multiple_owners` | 多个占用者 | 退回 GET 看清单，**不自动选**；要点名用严格模式 |
+| `409 multiple_owners` | 多个占用者 | 调 `/api/v1/agent/authorize`，由本机授权窗口选择候选并取得一次性 `user_grant_id`（60 秒、单次、绑定完整指纹），再严格关闭；**不自动选**，agent 自报 pid/proc/started 不等于用户授权 |
 | `400 target_identity_required` | 指纹缺失/过期（`snapshot_id` 60 秒有效） | 重新 GET 取指纹 |
-| `429 rate_limited` | 真实强杀频率闸（每通道每分钟 6 次；`already_free` 不计入） | 等一分钟，检查是不是调用循环 |
+| `429 rate_limited` | 强杀每通道每分钟 6 次（`already_free` 不计入）；authorize 按 token+port 每 60 秒 6 次，第 7 次不扫描、不弹窗 | 等窗口滑过，检查是不是调用循环 |
 
 **验收语言（唯一判据）**：只有 `ok:true 且 remaining=[]` 才算「关干净」。`already_free=true` 是幂等（本来就没占）。`remaining` 非空＝父退出子残留或端口易主，按当前占用者重新确认。
 
@@ -41,11 +41,11 @@
 
 **同一个软件，用户态可关、服务态受保护**——判定依据是会话和路径，不是软件名。这不是矛盾，是保护线在正确工作。
 
-## 数字（全部从实物复核，2026-11-17）
+## 数字（全部从实物复核，2026-11-20）
 
 | 项 | 值 | 出处 |
 |---|---|---|
-| 单元测试 | **159 个** | [tests](tests)（[test_port_console.py](tests/test_port_console.py)，`unittest discover`） |
+| 单元测试 | **174 个** | [tests](tests)（`unittest discover` 全量；1.4.1 基线时 test_port_console.py 内 159 个） |
 | 端到端验收 | **21 步** | [acceptance_api.py](tests/acceptance_api.py) |
 | 自动识别规则 | **21 条**（通用示例，不含本机定制） | [rules.json](rules.json) |
 | 端口知识库 | **108 条** | [ports.json](ports.json) / [ports.md](ports.md) |
@@ -56,6 +56,7 @@
 | 端口区间 | **3999–4098**（被占自动顺延） | README §6.1 |
 | 审计日志 | `kill_audit.jsonl`，超 1 MiB 轮转，最多 3 个备份 | README §7 |
 | 运行依赖 | **零第三方包**，Python 3.10+ 标准库 | README 头部 |
+| 离线证据 | `local_clue` 标注，不冒充权威 API；离线关闭同样经本机授权窗口 | [local_ops.py](local_ops.py) / [user_consent.py](user_consent.py) |
 
 > ⚠️ **识别率不宣称达标**：54% 是实测值，达标线 70%。AI 对外描述时必须照实说「约 54%、未达标」，不许说「能认全」。
 
@@ -70,7 +71,7 @@
 ## 口径真源与注意
 
 - 身份判定只认 [rules.json](rules.json) / `port_map.json`（运行时生成）；端口对照表（[ports.json](ports.json) / [ports.md](ports.md)）是知识层，**不参与任何关闭判定**——删掉它 `kill_allowed` 逐字节不变（有单测把守）。
-- token（`api_token.txt`）等同本机授权：不打印、不落聊天窗、不外传。
-- **版本真源**：以 `SERVER_VERSION = PortConsole/1.4.1`（`port_console.py:53`）为准；[SKILL.md](SKILL.md) frontmatter 本版同步为 1.4.1。
+- token（`api_token.txt`）证明调用方获准使用程序化接口，**不等同于用户对具体目标的一次性授权**；多占用仍需 `user_grant_id`。不打印、不落聊天窗、不外传。
+- **版本真源**：以 `SERVER_VERSION = PortConsole/1.4.2`（`port_console.py:54`）为准；[SKILL.md](SKILL.md) frontmatter 本版同步为 1.4.2。
 - **运行时自建件**（不在本发布包内，AI 别当发布文件去找）：`runtime.json`、`port_map.json`、`unknown.json`、`dynamic_protection.json`、`kill_audit.jsonl`、`api_token.txt`——由程序在本机运行时生成，不随包分发、不入指纹账。
 - 许可与署名见 [LICENSE](LICENSE) / [NOTICE.md](NOTICE.md) / [CHANGELOG.md](CHANGELOG.md)。

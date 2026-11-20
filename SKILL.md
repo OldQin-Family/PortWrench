@@ -1,6 +1,6 @@
 ---
 name: portwrench
-version: "1.4.1"
+version: "1.4.2"
 author: PortWrench Team
 license: MIT
 metadata:
@@ -34,7 +34,8 @@ description: "Use when 查本机哪个端口被谁占了、关掉关了黑框还
 3. **403 不要再试**——受保护目标（保护端口/Session 0/System32 宿主/信息读不到
    fail closed/用户在面板上手动保护的目标），工具拒杀是设计不是故障；
 4. **只有 `ok:true 且 remaining=[]` 才算关干净**；
-5. token（本包 `api_token.txt`）等同本机授权：不打印、不落聊天窗、不外传。
+5. token（本包 `api_token.txt`）是程序化通道凭据，不打印、不落聊天窗、不外传；它不等同于用户对具体目标的一次性授权。
+6. 在线多占用必须先调 `/api/v1/agent/authorize`，由本机窗口选择候选并取得 `user_grant_id`；离线结果只认 `local_clue`，不得冒充权威 API 结论。
 
 ## 最短路径（优先 CLI）
 
@@ -46,12 +47,17 @@ python <本包>\portctl.py protection      # 保护自检
 python <本包>\portctl.py health          # 在线检查
 ```
 
-- 服务没起 → 提醒用户双击本包 `启动端口控制台.bat`（不要自己用管理员硬起）；
+- 服务没起 → 提醒用户启动本包 `启动端口控制台.bat`，或直接运行 `python port_console.py`；不要自己用管理员硬起。
 - 没有 CLI 环境时用 HTTP 口径：
 
 ```
+# 单占用
 GET /api/v1/agent/ports?port=<端口>   → 看名字/级别/kill_allowed，拿 snapshot_id
 POST /api/v1/agent/kill-by-port      {"port":<端口>,"snapshot_id":"<上一步>","confirm":true}
+
+# 多占用
+POST /api/v1/agent/authorize         {"port":<端口>} → 本机窗口选择，拿 user_grant_id
+POST /api/v1/agent/kill              {"port":<端口>,"pid":...,"proc":...,"started":...,"confirm":true,"user_grant_id":"<上一步>"}
 Header: X-Port-Console-Token: <token>（建议再加 X-Port-Console-Client: <你的名字>，审计留名）
 ```
 
@@ -62,7 +68,7 @@ Header: X-Port-Console-Token: <token>（建议再加 X-Port-Console-Client: <你
 | `already_free`（200） | 端口本来就空 | 收工 |
 | `400 target_identity_required` | 指纹缺失/过期 | 重新 GET 取 snapshot_id |
 | `409 target_changed` | 端口易主/PID 复用 | 重新确认，别硬来 |
-| `409 multiple_owners` | 多个占用者 | 退回 GET 看清单，严格模式点名 |
+| `409 multiple_owners` | 多个占用者 | 调 `/agent/authorize`，由用户本机选择候选 |
 | `403 kill_not_allowed` | 受保护 | **不要再试**，向用户说明是保护线 |
 | `429 rate_limited` | 频率闸（每通道 6 次/分钟） | 等一分钟，检查调用循环 |
 
@@ -74,11 +80,12 @@ Header: X-Port-Console-Token: <token>（建议再加 X-Port-Console-Client: <你
   （宁可拒杀不赌）——同一软件"用户态可杀、服务态不可杀"是保护线在正确工作；
 - 端口还占着看返回 `remaining`，按它给的当前占用者重新确认——
   工具不会拿旧快照追杀新进程。
+- 离线本地快照只作 `local_clue`；关闭前必须本机授权，不能把本地观察说成控制台 API 事实。
 
 ## 自验
 
 ```
-py -3 -B -m unittest discover -s tests -v        # 159 个单测
+py -3 -B -m unittest discover -s tests -v        # 174 个单测（1.4.1 基线时 test_port_console.py 内 159 个）
 py -3 -B tests\acceptance_api.py --base-url <BASE> --token-file api_token.txt   # 21 步（<BASE> 取 portctl.py health 输出）
 ```
 
@@ -113,8 +120,9 @@ py -3 -B tests\acceptance_api.py --base-url <BASE> --token-file api_token.txt   
    System32 hosts / unreadable info → fail-closed / user-protected via the panel).
    Refusal is by design;
 4. **Done means `ok:true` AND `remaining=[]`.** Anything else is not clean;
-5. The token (`api_token.txt`) equals local authorization: never print it,
-   never paste it into chats, never share it.
+5. The token (`api_token.txt`) is a programmatic-channel credential: never print it,
+   never paste it into chats, never share it. It is not one-time authorization for a specific target.
+6. For online multiple owners, call `/api/v1/agent/authorize` first; the local window selects a candidate and returns `user_grant_id`. Offline results are only `local_clue`, never authoritative API conclusions.
 
 ## Shortest path (CLI first)
 
@@ -126,15 +134,18 @@ python <package>\portctl.py protection      # protection self-check
 python <package>\portctl.py health          # liveness check
 ```
 
-- Service not running → ask the user to start `启动端口控制台.bat`
-  (Windows, Python 3.10+; default `http://127.0.0.1:3999/` — if taken, the
-  console shifts to 3999–4098; take the real URL from `portctl.py health`
-  or `runtime.json`).
+- Service not running → ask the user to start `启动端口控制台.bat`, or run `python port_console.py` directly.
+  Take the real URL from `portctl.py health` or `runtime.json`.
 - Without a shell, use HTTP:
 
 ```
+# Single owner
 GET /api/v1/agent/ports?port=<port>   → name / level / kill_allowed + snapshot_id
 POST /api/v1/agent/kill-by-port      {"port":<port>,"snapshot_id":"...","confirm":true}
+
+# Multiple owners
+POST /api/v1/agent/authorize         {"port":<port>} → local window selects, returns user_grant_id
+POST /api/v1/agent/kill              {"port":<port>,"pid":...,"proc":...,"started":...,"confirm":true,"user_grant_id":"..."}
 Header: X-Port-Console-Token: <token>   (add X-Port-Console-Client: <your-name> for the audit trail)
 ```
 
@@ -145,7 +156,7 @@ Header: X-Port-Console-Token: <token>   (add X-Port-Console-Client: <your-name> 
 | `already_free` (200) | Port was already free | Done |
 | `400 target_identity_required` | Fingerprint missing/expired | GET a fresh `snapshot_id` |
 | `409 target_changed` | Port owner changed / PID reused | Re-confirm; do not force |
-| `409 multiple_owners` | Several owners | Back to GET, use strict mode to name one |
+| `409 multiple_owners` | Several owners | Call `/agent/authorize`; user selects a candidate locally |
 | `403 kill_not_allowed` | Protected | **Do not retry**; explain the protection line |
 | `429 rate_limited` | Rate gate (6 real kills/min/channel) | Wait a minute; check for loops |
 
@@ -158,10 +169,11 @@ Header: X-Port-Console-Token: <token>   (add X-Port-Console-Client: <your-name> 
   protected as a service is the protection line working correctly;
 - Port still bound? Read `remaining` and re-confirm against the current owner —
   the tool never hunts a new process with an old snapshot.
+- Offline local snapshots are only `local_clue`; local authorization is required before closure and they must not be presented as console API facts.
 
 ## Self-test
 
 ```
-py -3 -B -m unittest discover -s tests -v        # 159 unit tests
+py -3 -B -m unittest discover -s tests -v        # 174 unit tests (1.4.1 baseline: 159 in test_port_console.py)
 py -3 -B tests\acceptance_api.py --base-url <BASE> --token-file api_token.txt   # 21 steps (<BASE> from portctl.py health)
 ```

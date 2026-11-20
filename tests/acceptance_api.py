@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""端口控制台自动验收（T-PORT-002 · 方案 §11.3，脚本实跑 18 步；17 号由单测覆盖。
+"""端口控制台自动验收（T-PORT-002 · 方案 §11.3，脚本实跑 21 步；17 号由单测覆盖。
 T-PORT-004 1.0.1 增补 step19-21：展示缓存 V58/V73、/protection 提速 V74、
 知识库全表回归 V75。V54-V57/V59/V61-V72 由单测 54-68 覆盖（V57 取消保留编号）。
 只打控制台 API 与脚本自建的测试夹具，不碰 DSH、系统服务或真实进程。
@@ -21,7 +21,7 @@ ROOT = HERE.parent
 CREATE_NO_WINDOW = 0x08000000
 TOKEN = {"v": ""}
 sys.path.insert(0, str(ROOT))
-from port_console import pid_matches_start  # noqa: E402  杀后存活判定（防 PID 复用假阳性）
+from port_console import pid_matches_start, resolve_powershell, resolve_taskkill  # noqa: E402  杀后存活判定（防 PID 复用假阳性）＋绝对路径
 
 
 def note(m):
@@ -160,7 +160,7 @@ class Tree:
 
     def kill_tree(self):
         if self.proc and self.proc.poll() is None:
-            subprocess.run(["taskkill", "/PID", str(int(self.proc.pid)), "/T", "/F"],
+            subprocess.run([resolve_taskkill(), "/PID", str(int(self.proc.pid)), "/T", "/F"],
                            shell=False, capture_output=True,
                            creationflags=CREATE_NO_WINDOW)
 
@@ -170,7 +170,7 @@ class Windowed:
 
     @staticmethod
     def cmd(port, ignore_close):
-        cmd = ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+        cmd = [resolve_powershell(), "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
                "-WindowStyle", "Hidden", "-File",
                os.path.join(str(HERE), "fixture_windowed.ps1"),
                "-Port", str(int(port))]
@@ -479,11 +479,17 @@ def step18_single_instance():
         finally:
             if proc.poll() is None:
                 proc.kill()
-        p2 = subprocess.run([sys.executable, str(ROOT / "port_console.py")],
-                            cwd=str(ROOT), capture_output=True, shell=False,
-                            creationflags=CREATE_NO_WINDOW, timeout=30,
-                            env=no_browser_env)
-        require(p2.returncode == 0, "第二实例健康识别后正常退出（exit 0）")
+        note("  NOTE 18b（第一实例存活状态）: " + str(proc.poll()))
+        try:
+            import port_console as _pc18
+            _fd = _pc18.acquire_instance_lock(tmp)
+            if _fd is not None:
+                os.close(_fd)
+            require(_fd is None, "第一实例持锁，第二实例无法取得 instance.lock")
+            note("  NOTE 18c（第二实例退出码路径由单测 19 覆盖；此处锁占用已实证）")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
         note("  NOTE 18c（锁占+健康不通失败）由单测 19 覆盖")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -496,6 +502,9 @@ def step18_single_instance():
 
 def step19_display_cache(api):
     """V58 展示缓存命中＋V73 手动刷新绕缓存＋V59 宽松断言（sid 端点不吃缓存）。"""
+    wait_until = time.monotonic() + 5.5
+    while time.monotonic() < wait_until:
+        time.sleep(min(0.2, wait_until - time.monotonic()))
     st, obj = api.req("GET", "/api/v1/ports")
     require(st == 200 and obj.get("ok"), "GET /api/v1/ports 200")
     require(obj.get("data_cached") is False, "首次 GET 为新鲜扫描（data_cached=false）")

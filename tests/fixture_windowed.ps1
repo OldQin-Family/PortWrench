@@ -1,8 +1,8 @@
-﻿# 有窗监听夹具（fixture_windowed.ps1）
-# 用法：powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File fixture_windowed.ps1 -Port 46001 [-IgnoreCloseCount 1]
-# 行为：创建带标题的可见 WinForms 窗体 + 127.0.0.1 TcpListener；就绪后输出一行 READY；
-#       收到 WM_CLOSE 正常退出；-IgnoreCloseCount N 时由 FormClosing 取消前 N 次关窗
-#       （用于稳定构造 428 强杀确认路径）。只用于本测试：不写文件、不联网（仅回环）。
+# Windowed listening fixture (fixture_windowed.ps1)
+# Usage: powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File fixture_windowed.ps1 -Port 46001 [-IgnoreCloseCount 1]
+# Behavior: creates a visible WinForms window and a 127.0.0.1 TcpListener; prints READY when ready.
+# It exits normally on WM_CLOSE. With -IgnoreCloseCount N, FormClosing cancels the first N close
+# attempts to build the 428 force-confirmation path. Test-only: no file writes, no network except loopback.
 param(
     [int]$Port = 46001,
     [int]$IgnoreCloseCount = 0
@@ -30,8 +30,8 @@ $form.add_FormClosing({
 $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
 $listener.Start()
 
-# 监听就绪后、进入消息循环前，主流程输出一行 READY
-# （不可放 Add_Shown 事件里——事件回调的 Write-Output 不进 stdout 管道）
+# Emit READY only after the listener has started and before the message loop.
+# Do not use Add_Shown: Write-Output in event callbacks does not reach the stdout pipe.
 Write-Output 'READY'
 
 try {
